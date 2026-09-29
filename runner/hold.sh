@@ -12,8 +12,9 @@ touch "$box/active"
 end=$((SECONDS + MINUTES * 60))
 while ((SECONDS < end)); do
   [[ -e $box/stop ]] && stop "stopped"
-  pgrep -u "$USER" -f "^sshd(-session)?: $USER" >/dev/null && touch "$box/active"
-  (($(date +%s) - $(stat -c %Y "$box/active") > IDLE_MINUTES * 60)) && stop "no ssh connection for $IDLE_MINUTES minutes"
+  # An ssh session or a `box run` job still running counts as activity.
+  pgrep -u "$USER" -f "^sshd(-session)?: $USER|\.box/jobs/" >/dev/null && touch "$box/active"
+  (($(date +%s) - $(stat -c %Y "$box/active") > IDLE_MINUTES * 60)) && stop "idle for $IDLE_MINUTES minutes"
   sleep 5
 done
 stop "reached $MINUTES minutes"

@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // box — lease a GitHub Actions runner and work on it over ssh.
-// Secrets stay on this machine: GitHub only ever sees a public key, the runner only ever
-// receives a tunnel token that is deleted with the lease.
+// Secrets stay on this machine: GitHub only ever sees a public key, and with named tunnels
+// the runner gets a tunnel token that is revoked with the lease.
 import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import fs from "node:fs";
@@ -54,14 +54,15 @@ function ensureState() {
   }
 }
 
-// The GitHub API is flaky from behind the proxy; retry everything but real HTTP errors.
-function gh(args: string[]): string {
+// The GitHub API is flaky from behind the proxy; retry everything but real HTTP errors
+// and calls that must not happen twice.
+function gh(args: string[], { retry = true } = {}): string {
   for (let attempt = 1; ; attempt++) {
     try {
       return execFileSync("gh", args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
     } catch (e) {
       const stderr = String((e as { stderr?: unknown }).stderr ?? "");
-      if (attempt >= 4 || /HTTP 4\d\d/.test(stderr)) throw e;
+      if (!retry || attempt >= 4 || /HTTP 4\d\d/.test(stderr)) throw e;
       Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 2000 * attempt);
     }
   }
@@ -197,6 +198,8 @@ async function zoneOf(token: string, zone: string) {
 // neither keep a connector up nor block the deletion.
 async function deleteTunnel(token: string, accountId: string, tunnelId: string) {
   const t = `/accounts/${accountId}/cfd_tunnel/${tunnelId}`;
+  const current = await cf<{ deleted_at: string | null } | null>(token, t).catch(() => null);
+  if (!current || current.deleted_at) return;
   await cf(token, t, "PATCH", { tunnel_secret: randomBytes(32).toString("base64") });
   for (let i = 0; ; i++) {
     await cf(token, `${t}/connections`, "DELETE").catch(() => {});
@@ -209,12 +212,13 @@ async function deleteTunnel(token: string, accountId: string, tunnelId: string) 
   }
 }
 
+// Both steps are safe to repeat, so a `box down` that failed halfway can simply be retried.
 async function deleteNamed(token: string, named: NonNullable<Lease["named"]>) {
-  await deleteTunnel(token, named.accountId, named.tunnelId);
   if (named.dnsId)
     await cf(token, `/zones/${named.zoneId}/dns_records/${named.dnsId}`, "DELETE").catch((e: Error) => {
       if (!/"code":81044/.test(e.message)) throw e;
     });
+  await deleteTunnel(token, named.accountId, named.tunnelId);
 }
 
 // Move the box from its public quick tunnel to a tunnel of our own. The token travels
@@ -293,7 +297,8 @@ function verifyBranch(repo: string, owner: string): string {
     die(`${repo}:${WORKFLOW} is not the agent-box workflow; run \`box install ${repo}\``);
   const cmp = ghJson<{ status: string; files?: { filename: string }[] }>(`repos/${ACTION}/compare/${pinned}...main`);
   if (cmp.status !== "ahead" && cmp.status !== "identical") die(`${repo} pins ${pinned}, which is not on ${ACTION} main`);
-  if (cmp.files?.some((f) => f.filename === "action.yml" || f.filename.startsWith("runner/")))
+  const files = cmp.files ?? [];
+  if (files.length >= 300 || files.some((f) => f.filename === "action.yml" || f.filename.startsWith("runner/")))
     die(`${repo} pins an older runner; run \`box install ${repo}\``);
   return tip;
 }
@@ -301,28 +306,28 @@ function verifyBranch(repo: string, owner: string): string {
 // The artifact comes from the runner, so it is unpacked away from the lease directory and
 // only box.json, with plain string fields, is accepted.
 async function readBoxArtifact(repo: string, runId: number) {
-  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "agent-box-"));
-  try {
-    for (let attempt = 1; ; attempt++) {
-      try {
-        gh(["run", "download", String(runId), "-R", repo, "-n", "box", "-D", tmp]);
-        break;
-      } catch (e) {
-        if (attempt >= 5) throw e;
-        await sleep(3000);
-      }
+  for (let attempt = 1; ; attempt++) {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "agent-box-"));
+    try {
+      gh(["run", "download", String(runId), "-R", repo, "-n", "box", "-D", tmp]);
+      return parseBoxJson(tmp);
+    } catch (e) {
+      if (attempt >= 5 || !(e as { stderr?: unknown }).stderr) throw e;
+      await sleep(3000);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
     }
-    const files = fs.readdirSync(tmp);
-    if (files.length !== 1 || files[0] !== "box.json") throw new Error(`unexpected artifact contents: ${files.join(", ")}`);
-    const box = JSON.parse(fs.readFileSync(path.join(tmp, "box.json"), "utf8")) as Record<string, unknown>;
-    const { host, hostKey, user } = box;
-    if (typeof host !== "string" || !/^[a-z0-9-]+\.trycloudflare\.com$/.test(host)) throw new Error("unexpected tunnel host");
-    if (typeof hostKey !== "string" || !/^ssh-ed25519 [A-Za-z0-9+/]+={0,2}$/.test(hostKey)) throw new Error("unexpected host key");
-    if (typeof user !== "string" || !/^[a-z_][a-z0-9_-]*$/.test(user)) throw new Error("unexpected user");
-    return { host, hostKey, user };
-  } finally {
-    fs.rmSync(tmp, { recursive: true, force: true });
   }
+}
+
+function parseBoxJson(dir: string) {
+  const files = fs.readdirSync(dir);
+  if (files.length !== 1 || files[0] !== "box.json") throw new Error(`unexpected artifact contents: ${files.join(", ")}`);
+  const { host, hostKey, user } = JSON.parse(fs.readFileSync(path.join(dir, "box.json"), "utf8")) as Record<string, unknown>;
+  if (typeof host !== "string" || !/^[a-z0-9-]+\.trycloudflare\.com$/.test(host)) throw new Error("unexpected tunnel host");
+  if (typeof hostKey !== "string" || !/^ssh-ed25519 [A-Za-z0-9+/]+={0,2}$/.test(hostKey)) throw new Error("unexpected host key");
+  if (typeof user !== "string" || !/^[a-z_][a-z0-9_-]*$/.test(user)) throw new Error("unexpected user");
+  return { host, hostKey, user };
 }
 
 // ---------------------------------------------------------------- commands
@@ -345,7 +350,9 @@ async function up(args: string[]) {
 
   try {
     const pubkey = fs.readFileSync(`${dir}/id_ed25519.pub`, "utf8").trim();
-    gh(["workflow", "run", "agent-box.yml", "-R", l.repo, "--ref", BRANCH, "-f", `lease=${l.id}`, "-f", `pubkey=${pubkey}`, "-f", `minutes=${minutes}`]);
+    gh(["workflow", "run", "agent-box.yml", "-R", l.repo, "--ref", BRANCH, "-f", `lease=${l.id}`, "-f", `pubkey=${pubkey}`, "-f", `minutes=${minutes}`], {
+      retry: false,
+    });
     log(`${l.id}: dispatched on ${l.repo}, waiting for a runner`);
 
     type Run = { id: number; display_title: string; head_sha: string; path: string; event: string; status: string; actor: { login: string }; html_url: string };
@@ -382,8 +389,11 @@ async function up(args: string[]) {
         await upgradeToNamed(l, c, token, box.user);
       } catch (e) {
         log(`staying on the quick tunnel: ${(e as Error).message}`);
-        if (l.named) await deleteNamed(token, l.named).catch(() => {});
-        l.named = undefined;
+        if (l.named)
+          await deleteNamed(token, l.named).then(
+            () => (l.named = undefined),
+            (e: Error) => log(`tunnel ${l.named?.tunnelId} is left for \`box down\`: ${e.message}`),
+          );
         writeSshConfig(l, box.host, box.user);
         saveLease(l);
       }
@@ -424,15 +434,38 @@ function snapshot(ref: string, untracked: boolean) {
     GIT_COMMITTER_EMAIL: fixed.GIT_AUTHOR_EMAIL,
     GIT_COMMITTER_DATE: fixed.GIT_AUTHOR_DATE,
   });
-  const changed = ref === "HEAD" ? git(["diff", "--name-only", "HEAD", tree]).split("\n").filter(Boolean) : [];
+  let base = "HEAD";
+  try {
+    git(["rev-parse", "--verify", "HEAD^{commit}"]);
+  } catch {
+    base = git(["hash-object", "-t", "tree", "/dev/null"]);
+  }
+  const changed = ref === "HEAD" ? git(["diff", "--name-only", base, tree]).split("\n").filter(Boolean) : [];
   return { commit, changed };
 }
 
+function githubRepoOf(url: string) {
+  const scp = /^(?:[\w.-]+@)?((?:ssh\.)?github\.com):(.+)$/.exec(url);
+  let host: string, pathname: string;
+  if (scp) [, host, pathname] = scp;
+  else {
+    try {
+      const u = new URL(url);
+      [host, pathname] = [u.hostname, u.pathname];
+    } catch {
+      return undefined;
+    }
+  }
+  if (host !== "github.com" && host !== "ssh.github.com") return undefined;
+  const m = /^\/?([\w.-]+)\/([\w.-]+?)(?:\.git)?\/?$/.exec(pathname);
+  return m ? `${m[1]}/${m[2]}`.toLowerCase() : undefined;
+}
+
 function remoteMatches(repo: string) {
-  const want = repo.toLowerCase();
-  return git(["remote", "-v"])
+  return git(["remote"])
     .split("\n")
-    .some((line) => /github\.com[:/]([\w.-]+\/[\w.-]+?)(?:\.git)?\s/.exec(line)?.[1]?.toLowerCase() === want);
+    .filter(Boolean)
+    .some((r) => githubRepoOf(git(["remote", "get-url", r])) === repo.toLowerCase());
 }
 
 function push(args: string[]) {
@@ -442,7 +475,7 @@ function push(args: string[]) {
     die(`this checkout has no remote for ${l.repo}; pass --any-repo if that is intended`);
   const { commit, changed } = snapshot(ref, args.includes("--untracked"));
   const init = ssh(l, "git init -q ~/src", { timeout: 60_000 });
-  if (init.status !== 0) die(`cannot prepare ~/src: ${init.stderr}`);
+  if (init.status !== 0) die(`cannot prepare ~/src: ${clean(init.stderr)}`);
   const r = spawnSync(
     "git",
     ["push", "--quiet", "--force", "--no-verify", "--no-follow-tags", "--recurse-submodules=no", "box:src", `${commit}:refs/heads/box`],
@@ -450,29 +483,70 @@ function push(args: string[]) {
   );
   if (r.status !== 0) die("git push failed");
   const co = ssh(l, `git -C ~/src checkout -q --force --detach ${commit}`, { timeout: 120_000 });
-  if (co.status !== 0) die(`checkout failed: ${co.stderr}`);
+  if (co.status !== 0) die(`checkout failed: ${clean(co.stderr)}`);
   const shown = changed.slice(0, 20).join(", ") + (changed.length > 20 ? `, … ${changed.length - 20} more` : "");
   log(`${l.id}: ~/src = ${ref}${changed.length ? ` + ${changed.length} changed file(s): ${shown}` : ""}`);
 }
 
 // What comes back from the box is untrusted: when it is not going to a terminal (an agent is
-// reading it), strip escape sequences and control characters.
-const CONTROL = /\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-_]|[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\u0080-\u009f]/g;
+// reading it), strip escape sequences, control and invisible format characters.
+const CONTROL =
+  /\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-_]|[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\u0080-\u009f]|\p{Cf}/gu;
+const clean = (s: string) => s.replace(CONTROL, "").replace(/\r(?!\n)/g, "\n");
 
-function run(args: string[]) {
+// The command runs detached on the box, so a dropped tunnel only interrupts the output: the
+// follower reconnects and resumes from the last byte it saw.
+async function run(args: string[]) {
   const l = loadLease(args[0]);
   const command = args.slice(1).join(" ");
   if (!command) die("usage: box run <id> <command>");
-  const child = spawn("ssh", ["-F", sshConfig(l.id), "box", `cd ~/src 2>/dev/null; ${command}`], { stdio: ["ignore", "pipe", "pipe"] });
-  for (const [from, to] of [
-    [child.stdout, process.stdout],
-    [child.stderr, process.stderr],
-  ] as const) {
-    const decoder = new StringDecoder("utf8");
-    from.on("data", (chunk: Buffer) => to.write(to.isTTY ? chunk : decoder.write(chunk).replace(CONTROL, "")));
-    from.on("end", () => to.isTTY || to.write(decoder.end().replace(CONTROL, "")));
+  const job = `~/.box/jobs/${randomBytes(4).toString("hex")}`;
+  const start = ssh(
+    l,
+    `mkdir -p ${job} && cat > ${job}/cmd && cd ~/src 2>/dev/null; ` +
+      `setsid nohup bash -c 'bash ${job}/cmd > ${job}/log 2>&1 < /dev/null; echo $? > ${job}/exit' > /dev/null 2>&1 < /dev/null & echo $!`,
+    { input: command, timeout: 60_000 },
+  );
+  const pid = /^(\d+)\s*$/.exec(start.stdout ?? "")?.[1];
+  if (start.status !== 0 || !pid) die(`cannot start the command: ${clean(start.stderr ?? "")}`);
+
+  let stopping = false;
+  const stop = (code: number) => {
+    stopping = true;
+    ssh(l, `kill -TERM -- -${pid} 2>/dev/null; true`, { timeout: 20_000 });
+    process.exit(code);
+  };
+  process.on("SIGINT", () => stop(130));
+  process.on("SIGTERM", () => stop(143));
+
+  const out = process.stdout;
+  const decoder = new StringDecoder("utf8");
+  let offset = 0;
+  let failingSince: number | undefined;
+  for (;;) {
+    const attempt = Date.now();
+    let received = false;
+    const status = await new Promise<number | null>((resolve) => {
+      const child = spawn("ssh", ["-F", sshConfig(l.id), "box", `tail -c +${offset + 1} --pid=${pid} -f ${job}/log`], {
+        stdio: ["ignore", "pipe", "ignore"],
+      });
+      child.stdout.on("data", (chunk: Buffer) => {
+        offset += chunk.length;
+        received = true;
+        out.write(out.isTTY ? chunk : clean(decoder.write(chunk)));
+      });
+      child.on("close", resolve);
+    });
+    if (stopping) return;
+    if (status === 0) break;
+    if (received || Date.now() - attempt > 30_000) failingSince = undefined;
+    failingSince ??= attempt;
+    if (Date.now() - failingSince > 10 * 60_000) die("lost the box for 10 minutes; the command may still be running");
+    await sleep(3000);
   }
-  child.on("close", (code) => process.exit(code ?? 255));
+  if (!out.isTTY) out.write(clean(decoder.end()));
+  const exit = ssh(l, `cat ${job}/exit 2>/dev/null`, { timeout: 60_000 });
+  process.exit(/^\d+/.test(exit.stdout ?? "") ? parseInt(exit.stdout, 10) : 255);
 }
 
 function shell(args: string[]) {
@@ -517,7 +591,8 @@ function ls() {
   }
 }
 
-// Release leases whose runner is gone, then any agent-box tunnel or DNS record no lease owns.
+// Release leases whose runner is gone, then any agent-box tunnel or DNS record no lease here
+// owns and that is older than the longest possible lease (it may be another machine's).
 async function gc() {
   for (const l of allLeases()) {
     const age = Date.now() - Date.parse(l.created);
@@ -528,22 +603,31 @@ async function gc() {
   const token = cloudflareToken(c);
   if (!token) return;
   const live = new Set(allLeases().map((l) => l.id));
+  const stale = (created: string) => Date.now() - Date.parse(created) > 6 * 3600_000;
   const { zoneId, accountId } = await zoneOf(token, c.zone!);
-  const tunnels = await cf<{ id: string; name: string }[]>(token, `/accounts/${accountId}/cfd_tunnel?is_deleted=false&per_page=100`);
+  const tunnels = await cf<{ id: string; name: string; created_at: string }[]>(
+    token,
+    `/accounts/${accountId}/cfd_tunnel?is_deleted=false&per_page=1000`,
+  );
   for (const t of tunnels) {
     const id = /^agent-box-([0-9a-f]{10})$/.exec(t.name)?.[1];
-    if (!id || live.has(id)) continue;
+    if (!id || live.has(id) || !stale(t.created_at)) continue;
     await deleteTunnel(token, accountId, t.id).then(
       () => log(`deleted tunnel ${t.name}`),
       (e: Error) => log(e.message),
     );
   }
-  const records = await cf<{ id: string; name: string; comment: string | null }[]>(token, `/zones/${zoneId}/dns_records?type=CNAME&per_page=500`);
+  const records = await cf<{ id: string; name: string; comment: string | null; created_on: string }[]>(
+    token,
+    `/zones/${zoneId}/dns_records?type=CNAME&per_page=5000`,
+  );
   for (const r of records) {
     const id = /^agent-box ([0-9a-f]{10}) /.exec(r.comment ?? "")?.[1];
-    if (!id || live.has(id) || r.name !== `box-${id}.${c.zone}`) continue;
-    await cf(token, `/zones/${zoneId}/dns_records/${r.id}`, "DELETE");
-    log(`deleted dns ${r.name}`);
+    if (!id || live.has(id) || r.name !== `box-${id}.${c.zone}` || !stale(r.created_on)) continue;
+    await cf(token, `/zones/${zoneId}/dns_records/${r.id}`, "DELETE").then(
+      () => log(`deleted dns ${r.name}`),
+      (e: Error) => log(e.message),
+    );
   }
 }
 
@@ -621,7 +705,7 @@ switch (cmd) {
     push(rest);
     break;
   case "run":
-    run(rest);
+    await run(rest);
     break;
   case "ssh":
     shell(rest);

@@ -22,9 +22,12 @@ after 60 minutes without an ssh connection or at `--minutes` (default and max 34
 - **The runner** generates its own host key and publishes it with its quick-tunnel address
   in a public artifact; `box up` pins that key before connecting.
 - **`box push`** sends one parentless commit whose tree is the working tree of tracked files
-  (or `--ref`'s tree): no history, no staged-only content, no untracked files unless
-  `--untracked`. It refuses to push from a checkout without a remote for the leased repo.
-- **`box run`** output is untrusted: when it is not a terminal, escape sequences and control
+  (or `--ref`'s tree): no history, no untracked files unless `--untracked`. Files that are
+  staged but not committed count as tracked and are sent; the files that differ from HEAD
+  are listed. It refuses to push from a checkout without a GitHub remote for the leased repo.
+- **`box run`** starts the command detached on the box and follows its output, reconnecting
+  after a dropped tunnel; Ctrl-C or SIGTERM kills it on the box. stdout and stderr arrive
+  merged. The output is untrusted: when it is not a terminal, escape sequences and control
   characters are stripped. Anything on the runner can `sudo`; never send credentials to it.
 
 ## Named tunnels (optional)
@@ -34,8 +37,9 @@ is involved. With `{"zone": "<zone>"}` in `~/.config/agent-box/config.json` and 
 `~/.config/agent-box/cloudflare-token` (Account › Cloudflare Tunnel › Edit, Zone › DNS ›
 Edit on that zone only), `box up` moves each box to `box-<id>.<zone>` on a tunnel created
 for that lease; `box down` rotates the tunnel secret and deletes the tunnel and its record.
-Use a zone that serves nothing else: whoever runs code on the box can serve anything on
-that hostname until the tunnel is deleted.
+Use a separate Cloudflare account whose only zone serves nothing else: the tunnel
+permission covers every tunnel in the account, local agents can read the token, and whoever
+runs code on the box can serve anything on its hostname until the tunnel is deleted.
 
 ## Trust
 
