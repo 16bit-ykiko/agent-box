@@ -1,0 +1,25 @@
+# Installed by `box install`; `box up` refuses to use this branch if the file differs.
+name: agent-box
+run-name: agent-box ${{ inputs.lease }}
+on:
+  push:
+    branches: [agent-box]
+  workflow_dispatch:
+    inputs:
+      lease:
+        required: true
+      pubkey:
+        required: true
+      minutes:
+        default: "340"
+permissions: {}
+jobs:
+  box:
+    if: github.event_name == 'workflow_dispatch' && github.actor == '16bit-ykiko' && github.triggering_actor == '16bit-ykiko'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    steps:
+      - uses: 16bit-ykiko/agent-box@1f69b9f3b939148d956be47b49b256e36bde9e2e
+        with:
+          pubkey: ${{ inputs.pubkey }}
+          minutes: ${{ inputs.minutes }}
