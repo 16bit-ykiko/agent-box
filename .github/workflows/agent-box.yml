@@ -19,7 +19,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 350
     steps:
-      - uses: 16bit-ykiko/agent-box@1f69b9f3b939148d956be47b49b256e36bde9e2e
+      - uses: 16bit-ykiko/agent-box@47ee17ab9627dd60d54a9356c5e3181c7293bcf5
         with:
           pubkey: ${{ inputs.pubkey }}
           minutes: ${{ inputs.minutes }}
