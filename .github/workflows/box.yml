@@ -1,0 +1,41 @@
+name: box
+on:
+  workflow_dispatch:
+    inputs:
+      pubkey:
+        required: true
+      os:
+        default: ubuntu-24.04
+      minutes:
+        default: "340"
+jobs:
+  box:
+    runs-on: ${{ inputs.os }}
+    timeout-minutes: 355
+    steps:
+      - name: start sshd and tunnel
+        env:
+          PUBKEY: ${{ inputs.pubkey }}
+        run: |
+          mkdir -p ~/.ssh && printf '%s\n' "$PUBKEY" >> ~/.ssh/authorized_keys
+          chmod go-w ~ && chmod 700 ~/.ssh && chmod 600 ~/.ssh/authorized_keys
+          command -v sshd >/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq openssh-server; }
+          sudo mkdir -p /run/sshd
+          sudo /usr/sbin/sshd -p 2222 -o PasswordAuthentication=no -o PubkeyAuthentication=yes
+          curl -fsSL -o ~/cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          chmod +x ~/cloudflared
+          nohup ~/cloudflared tunnel --no-autoupdate --url ssh://localhost:2222 > ~/cf.log 2>&1 &
+          for i in $(seq 90); do
+            host=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' ~/cf.log | head -1 || true)
+            [ -n "$host" ] && break; sleep 1
+          done
+          [ -n "$host" ] || { cat ~/cf.log; exit 1; }
+          printf 'host=%s\nuser=%s\n' "${host#https://}" "$USER" | tee ~/box.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: box
+          path: ~/box.txt
+      - name: hold
+        run: |
+          end=$((SECONDS + ${{ inputs.minutes }} * 60))
+          while [ $SECONDS -lt $end ] && [ ! -f ~/stop ]; do sleep 10; done
