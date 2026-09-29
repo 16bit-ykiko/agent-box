@@ -2,11 +2,12 @@
 // box — lease a GitHub Actions runner and work on it over ssh.
 // Secrets stay on this machine: GitHub only ever sees a public key, the runner only ever
 // receives a tunnel token that is deleted with the lease.
-import { execFileSync, spawnSync } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { StringDecoder } from "node:string_decoder";
 import { fileURLToPath } from "node:url";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -34,19 +35,38 @@ function die(msg: string): never {
 }
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+// `zone` turns on named tunnels. Use a zone that serves nothing else: whoever runs code on
+// the box can serve anything on box-<id>.<zone> until the tunnel is deleted.
 function config(): Config {
   const file = path.join(HOME, ".config/agent-box/config.json");
   const c = fs.existsSync(file) ? (JSON.parse(fs.readFileSync(file, "utf8")) as Partial<Config>) : {};
   return {
     owner: c.owner ?? gh(["api", "user", "--jq", ".login"]).trim(),
     zone: c.zone,
-    cloudflareTokenFile: (c.cloudflareTokenFile ?? "~/.config/cloudflare/token").replace(/^~/, HOME),
+    cloudflareTokenFile: (c.cloudflareTokenFile ?? "~/.config/agent-box/cloudflare-token").replace(/^~/, HOME),
   };
 }
 
-function gh(args: string[]): string {
-  return execFileSync("gh", args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+function ensureState() {
+  for (const dir of [STATE, path.join(STATE, "bin"), path.join(STATE, "leases")]) {
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    fs.chmodSync(dir, 0o700);
+  }
 }
+
+// The GitHub API is flaky from behind the proxy; retry everything but real HTTP errors.
+function gh(args: string[]): string {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return execFileSync("gh", args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+    } catch (e) {
+      const stderr = String((e as { stderr?: unknown }).stderr ?? "");
+      if (attempt >= 4 || /HTTP 4\d\d/.test(stderr)) throw e;
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 2000 * attempt);
+    }
+  }
+}
+const isNotFound = (e: unknown) => /HTTP 404/.test(String((e as { stderr?: unknown }).stderr ?? ""));
 function ghJson<T>(api: string): T {
   return JSON.parse(gh(["api", api])) as T;
 }
@@ -96,9 +116,9 @@ function writeSshConfig(l: Lease, host: string, user: string) {
     "  PermitLocalCommand no",
     "  BatchMode yes",
     "  LogLevel ERROR",
-    `  ProxyCommand ${cloudflaredPath()} access ssh --hostname %h`,
+    `  ProxyCommand /usr/bin/env -i HOME=${dir} PATH=/usr/bin:/bin ${cloudflaredPath()} access ssh --hostname %h`,
     "  ControlMaster auto",
-    `  ControlPath ${dir}/cm-%C`,
+    `  ControlPath ${dir}/cm`,
     "  ControlPersist 10m",
     "  ServerAliveInterval 30",
     "  ServerAliveCountMax 4",
@@ -122,7 +142,7 @@ async function waitForSsh(l: Lease, seconds: number) {
     if (r.status === 0) return;
     await sleep(3000);
   }
-  die(`cannot ssh into ${l.id}`);
+  throw new Error(`cannot ssh into ${l.id}`);
 }
 
 function closeMaster(l: Lease) {
@@ -145,9 +165,9 @@ async function ensureCloudflared() {
   if (!res.ok) die(`download failed: ${res.status} ${url}`);
   const bytes = Buffer.from(await res.arrayBuffer());
   if (createHash("sha256").update(bytes).digest("hex") !== CLOUDFLARED.sha256) die("cloudflared checksum mismatch");
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  fs.writeFileSync(`${file}.tmp`, bytes, { mode: 0o755 });
-  fs.renameSync(`${file}.tmp`, file);
+  const tmp = `${file}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, bytes, { mode: 0o700, flag: "wx" });
+  fs.renameSync(tmp, file);
 }
 
 // ---------------------------------------------------------------- cloudflare api
@@ -173,10 +193,11 @@ async function zoneOf(token: string, zone: string) {
   return { zoneId: z.id, accountId: z.account.id };
 }
 
-async function deleteNamed(token: string, named: NonNullable<Lease["named"]>) {
-  const t = `/accounts/${named.accountId}/cfd_tunnel/${named.tunnelId}`;
-  if (named.dnsId) await cf(token, `/zones/${named.zoneId}/dns_records/${named.dnsId}`, "DELETE").catch(() => {});
-  // The runner's connector can take a few seconds to go away after the stop.
+// Rotating the secret first revokes the token the runner holds, so a copied token can
+// neither keep a connector up nor block the deletion.
+async function deleteTunnel(token: string, accountId: string, tunnelId: string) {
+  const t = `/accounts/${accountId}/cfd_tunnel/${tunnelId}`;
+  await cf(token, t, "PATCH", { tunnel_secret: randomBytes(32).toString("base64") });
   for (let i = 0; ; i++) {
     await cf(token, `${t}/connections`, "DELETE").catch(() => {});
     try {
@@ -186,6 +207,14 @@ async function deleteNamed(token: string, named: NonNullable<Lease["named"]>) {
       await sleep(3000);
     }
   }
+}
+
+async function deleteNamed(token: string, named: NonNullable<Lease["named"]>) {
+  await deleteTunnel(token, named.accountId, named.tunnelId);
+  if (named.dnsId)
+    await cf(token, `/zones/${named.zoneId}/dns_records/${named.dnsId}`, "DELETE").catch((e: Error) => {
+      if (!/"code":81044/.test(e.message)) throw e;
+    });
 }
 
 // Move the box from its public quick tunnel to a tunnel of our own. The token travels
@@ -244,13 +273,14 @@ function actionSha() {
   return gh(["api", `repos/${ACTION}/commits/main`, "--jq", ".sha"]).trim();
 }
 
-// The branch must hold exactly our workflow, pinned to a commit on agent-box's main;
-// anything else could hand our ssh session to someone else's code.
+// The branch must hold exactly our workflow, pinned to a commit on agent-box's main whose
+// runner code is still current; anything else could hand our ssh session to other code.
 function verifyBranch(repo: string, owner: string): string {
   let tip: string;
   try {
     tip = gh(["api", `repos/${repo}/branches/${BRANCH}`, "--jq", ".commit.sha"]).trim();
-  } catch {
+  } catch (e) {
+    if (!isNotFound(e)) throw e;
     return die(`${repo} has no ${BRANCH} branch; run \`box install ${repo}\``);
   }
   const rules = ghJson<{ type: string }[]>(`repos/${repo}/rules/branches/${BRANCH}`).map((r) => r.type);
@@ -261,9 +291,38 @@ function verifyBranch(repo: string, owner: string): string {
   const pinned = /uses: [\w.-]+\/[\w.-]+@([0-9a-f]{40})\n/.exec(content)?.[1];
   if (!pinned || content !== renderWorkflow(owner, pinned))
     die(`${repo}:${WORKFLOW} is not the agent-box workflow; run \`box install ${repo}\``);
-  const status = gh(["api", `repos/${ACTION}/compare/${pinned}...main`, "--jq", ".status"]).trim();
-  if (status !== "ahead" && status !== "identical") die(`${repo} pins ${pinned}, which is not on ${ACTION} main`);
+  const cmp = ghJson<{ status: string; files?: { filename: string }[] }>(`repos/${ACTION}/compare/${pinned}...main`);
+  if (cmp.status !== "ahead" && cmp.status !== "identical") die(`${repo} pins ${pinned}, which is not on ${ACTION} main`);
+  if (cmp.files?.some((f) => f.filename === "action.yml" || f.filename.startsWith("runner/")))
+    die(`${repo} pins an older runner; run \`box install ${repo}\``);
   return tip;
+}
+
+// The artifact comes from the runner, so it is unpacked away from the lease directory and
+// only box.json, with plain string fields, is accepted.
+async function readBoxArtifact(repo: string, runId: number) {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "agent-box-"));
+  try {
+    for (let attempt = 1; ; attempt++) {
+      try {
+        gh(["run", "download", String(runId), "-R", repo, "-n", "box", "-D", tmp]);
+        break;
+      } catch (e) {
+        if (attempt >= 5) throw e;
+        await sleep(3000);
+      }
+    }
+    const files = fs.readdirSync(tmp);
+    if (files.length !== 1 || files[0] !== "box.json") throw new Error(`unexpected artifact contents: ${files.join(", ")}`);
+    const box = JSON.parse(fs.readFileSync(path.join(tmp, "box.json"), "utf8")) as Record<string, unknown>;
+    const { host, hostKey, user } = box;
+    if (typeof host !== "string" || !/^[a-z0-9-]+\.trycloudflare\.com$/.test(host)) throw new Error("unexpected tunnel host");
+    if (typeof hostKey !== "string" || !/^ssh-ed25519 [A-Za-z0-9+/]+={0,2}$/.test(hostKey)) throw new Error("unexpected host key");
+    if (typeof user !== "string" || !/^[a-z_][a-z0-9_-]*$/.test(user)) throw new Error("unexpected user");
+    return { host, hostKey, user };
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
 }
 
 // ---------------------------------------------------------------- commands
@@ -274,6 +333,7 @@ async function up(args: string[]) {
   const minutes = flag(args, "--minutes") ?? "340";
   if (!/^\d+$/.test(minutes) || +minutes < 5 || +minutes > 340) die("--minutes must be 5..340");
   const c = config();
+  ensureState();
   await ensureCloudflared();
   const tip = verifyBranch(repo, c.owner);
 
@@ -305,17 +365,11 @@ async function up(args: string[]) {
     for (let i = 0; i < 100 && !box; i++) {
       await sleep(3000);
       const { artifacts } = ghJson<{ artifacts: { name: string }[] }>(`repos/${l.repo}/actions/runs/${run.id}/artifacts`);
-      if (artifacts.some((a) => a.name === "box")) {
-        gh(["run", "download", String(run.id), "-R", l.repo, "-n", "box", "-D", dir]);
-        box = JSON.parse(fs.readFileSync(`${dir}/box.json`, "utf8")) as typeof box;
-      } else if (ghJson<Run>(`repos/${l.repo}/actions/runs/${run.id}`).status === "completed") {
+      if (artifacts.some((a) => a.name === "box")) box = await readBoxArtifact(l.repo, run.id);
+      else if (ghJson<Run>(`repos/${l.repo}/actions/runs/${run.id}`).status === "completed")
         throw new Error(`run ended before the box came up: ${run.html_url}`);
-      }
     }
     if (!box) throw new Error("the box never came up");
-    if (!/^[a-z0-9-]+\.trycloudflare\.com$/.test(box.host)) throw new Error("unexpected tunnel host");
-    if (!/^ssh-ed25519 [A-Za-z0-9+/]+={0,2}$/.test(box.hostKey)) throw new Error("unexpected host key");
-    if (!/^[a-z_][a-z0-9_-]*$/.test(box.user)) throw new Error("unexpected user");
     fs.writeFileSync(`${dir}/known_hosts`, `agent-box-${l.id} ${box.hostKey}\n`, { mode: 0o600 });
     writeSshConfig(l, box.host, box.user);
     await waitForSsh(l, 90);
@@ -336,42 +390,89 @@ async function up(args: string[]) {
     }
   } catch (e) {
     log((e as Error).message);
-    await down([l.id]);
+    await release(l).catch((e: Error) => log(`${l.id}: ${e.message}; retry with \`box down ${l.id}\``));
     process.exit(1);
   }
   log(`${l.id}: ready on ${l.host} (${l.repo}, up to ${minutes} min, stops after 60 min idle)`);
   console.log(l.id);
 }
 
-function dirtySnapshot(ref: string): { sha: string; dirty: boolean } {
-  const head = execFileSync("git", ["rev-parse", "--verify", `${ref}^{commit}`], { encoding: "utf8" }).trim();
-  if (ref !== "HEAD") return { sha: head, dirty: false };
-  const stash = execFileSync("git", ["stash", "create"], { encoding: "utf8" }).trim();
-  return stash ? { sha: stash, dirty: true } : { sha: head, dirty: false };
+const git = (args: string[], env?: NodeJS.ProcessEnv) =>
+  execFileSync("git", args, { encoding: "utf8", env: { ...process.env, ...env }, stdio: ["ignore", "pipe", "pipe"] }).trim();
+
+// One parentless commit holding just the tree: no history, no stash index commit, so
+// nothing that was ever committed or staged and later removed leaves this machine.
+function snapshot(ref: string, untracked: boolean) {
+  let tree: string;
+  if (ref !== "HEAD") tree = git(["rev-parse", "--verify", `${ref}^{tree}`]);
+  else {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "agent-box-"));
+    try {
+      const index = path.join(tmp, "index");
+      const real = git(["rev-parse", "--path-format=absolute", "--git-path", "index"]);
+      if (fs.existsSync(real)) fs.copyFileSync(real, index);
+      git(["add", untracked ? "-A" : "-u", "--", ":/"], { GIT_INDEX_FILE: index });
+      tree = git(["write-tree"], { GIT_INDEX_FILE: index });
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  }
+  const fixed = { GIT_AUTHOR_NAME: "agent-box", GIT_AUTHOR_EMAIL: "agent-box@localhost", GIT_AUTHOR_DATE: "@0 +0000" };
+  const commit = git(["commit-tree", tree, "-m", "agent-box snapshot"], {
+    ...fixed,
+    GIT_COMMITTER_NAME: fixed.GIT_AUTHOR_NAME,
+    GIT_COMMITTER_EMAIL: fixed.GIT_AUTHOR_EMAIL,
+    GIT_COMMITTER_DATE: fixed.GIT_AUTHOR_DATE,
+  });
+  const changed = ref === "HEAD" ? git(["diff", "--name-only", "HEAD", tree]).split("\n").filter(Boolean) : [];
+  return { commit, changed };
+}
+
+function remoteMatches(repo: string) {
+  const want = repo.toLowerCase();
+  return git(["remote", "-v"])
+    .split("\n")
+    .some((line) => /github\.com[:/]([\w.-]+\/[\w.-]+?)(?:\.git)?\s/.exec(line)?.[1]?.toLowerCase() === want);
 }
 
 function push(args: string[]) {
   const l = loadLease(args[0]);
   const ref = flag(args, "--ref") ?? "HEAD";
-  const { sha, dirty } = dirtySnapshot(ref);
+  if (!args.includes("--any-repo") && !remoteMatches(l.repo))
+    die(`this checkout has no remote for ${l.repo}; pass --any-repo if that is intended`);
+  const { commit, changed } = snapshot(ref, args.includes("--untracked"));
   const init = ssh(l, "git init -q ~/src", { timeout: 60_000 });
   if (init.status !== 0) die(`cannot prepare ~/src: ${init.stderr}`);
-  const r = spawnSync("git", ["push", "--quiet", "--force", "--no-verify", "box:src", `${sha}:refs/heads/box`], {
-    stdio: "inherit",
-    env: { ...process.env, GIT_SSH_COMMAND: `ssh -F ${sshConfig(l.id)}`, GIT_SSH_VARIANT: "ssh" },
-  });
+  const r = spawnSync(
+    "git",
+    ["push", "--quiet", "--force", "--no-verify", "--no-follow-tags", "--recurse-submodules=no", "box:src", `${commit}:refs/heads/box`],
+    { stdio: "inherit", env: { ...process.env, GIT_SSH_COMMAND: `ssh -F ${sshConfig(l.id)}`, GIT_SSH_VARIANT: "ssh" } },
+  );
   if (r.status !== 0) die("git push failed");
-  const co = ssh(l, `git -C ~/src checkout -q --force --detach ${sha}`, { timeout: 120_000 });
+  const co = ssh(l, `git -C ~/src checkout -q --force --detach ${commit}`, { timeout: 120_000 });
   if (co.status !== 0) die(`checkout failed: ${co.stderr}`);
-  log(`${l.id}: ~/src at ${sha.slice(0, 10)}${dirty ? " (HEAD + uncommitted changes to tracked files)" : ""}`);
+  const shown = changed.slice(0, 20).join(", ") + (changed.length > 20 ? `, … ${changed.length - 20} more` : "");
+  log(`${l.id}: ~/src = ${ref}${changed.length ? ` + ${changed.length} changed file(s): ${shown}` : ""}`);
 }
+
+// What comes back from the box is untrusted: when it is not going to a terminal (an agent is
+// reading it), strip escape sequences and control characters.
+const CONTROL = /\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-_]|[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\u0080-\u009f]/g;
 
 function run(args: string[]) {
   const l = loadLease(args[0]);
   const command = args.slice(1).join(" ");
   if (!command) die("usage: box run <id> <command>");
-  const r = ssh(l, `cd ~/src 2>/dev/null; ${command}`);
-  process.exit(r.status ?? 255);
+  const child = spawn("ssh", ["-F", sshConfig(l.id), "box", `cd ~/src 2>/dev/null; ${command}`], { stdio: ["ignore", "pipe", "pipe"] });
+  for (const [from, to] of [
+    [child.stdout, process.stdout],
+    [child.stderr, process.stderr],
+  ] as const) {
+    const decoder = new StringDecoder("utf8");
+    from.on("data", (chunk: Buffer) => to.write(to.isTTY ? chunk : decoder.write(chunk).replace(CONTROL, "")));
+    from.on("end", () => to.isTTY || to.write(decoder.end().replace(CONTROL, "")));
+  }
+  child.on("close", (code) => process.exit(code ?? 255));
 }
 
 function shell(args: string[]) {
@@ -380,18 +481,23 @@ function shell(args: string[]) {
   process.exit(r.status ?? 255);
 }
 
-async function down(args: string[]) {
-  const l = loadLease(args[0]);
+// The stop file ends the run cleanly; the cancel covers a runner that ignores it.
+async function release(l: Lease) {
   if (l.host && ssh(l, "touch ~/.box/stop", { timeout: 20_000 }).status === 0) log(`${l.id}: stopping`);
-  else if (l.runId) spawnSync("gh", ["run", "cancel", String(l.runId), "-R", l.repo], { stdio: "ignore" });
-  closeMaster(l);
+  if (l.runId) spawnSync("gh", ["run", "cancel", String(l.runId), "-R", l.repo], { stdio: "ignore" });
+  if (fs.existsSync(sshConfig(l.id))) closeMaster(l);
   if (l.named) {
     const token = cloudflareToken(config());
-    if (!token) die(`${l.id}: no cloudflare token to delete tunnel ${l.named.tunnelId}`);
-    await deleteNamed(token!, l.named).catch((e: Error) => die(`${l.id}: ${e.message}; retry with \`box gc\``));
+    if (!token) throw new Error(`no cloudflare token to delete tunnel ${l.named.tunnelId}`);
+    await deleteNamed(token, l.named);
   }
   fs.rmSync(leaseDir(l.id), { recursive: true, force: true });
   log(`${l.id}: released`);
+}
+
+async function down(args: string[]) {
+  const l = loadLease(args[0]);
+  await release(l).catch((e: Error) => die(`${l.id}: ${e.message}`));
 }
 
 function runStatus(l: Lease) {
@@ -415,7 +521,8 @@ function ls() {
 async function gc() {
   for (const l of allLeases()) {
     const age = Date.now() - Date.parse(l.created);
-    if (runStatus(l).startsWith("ended") || (!l.runId && age > 15 * 60_000)) await down([l.id]);
+    if (runStatus(l).startsWith("ended") || (!l.runId && age > 15 * 60_000))
+      await release(l).catch((e: Error) => log(`${l.id}: ${e.message}`));
   }
   const c = config();
   const token = cloudflareToken(c);
@@ -426,8 +533,7 @@ async function gc() {
   for (const t of tunnels) {
     const id = /^agent-box-([0-9a-f]{10})$/.exec(t.name)?.[1];
     if (!id || live.has(id)) continue;
-    await cf(token, `/accounts/${accountId}/cfd_tunnel/${t.id}/connections`, "DELETE").catch(() => {});
-    await cf(token, `/accounts/${accountId}/cfd_tunnel/${t.id}`, "DELETE").then(
+    await deleteTunnel(token, accountId, t.id).then(
       () => log(`deleted tunnel ${t.name}`),
       (e: Error) => log(e.message),
     );
@@ -450,7 +556,8 @@ function install(args: string[]) {
   let tip: string | undefined;
   try {
     tip = gh(["api", `repos/${repo}/branches/${BRANCH}`, "--jq", ".commit.sha"]).trim();
-  } catch {
+  } catch (e) {
+    if (!isNotFound(e)) throw e;
     tip = undefined;
   }
   const post = (api: string, body: unknown) =>
@@ -493,7 +600,9 @@ const USAGE = `usage:
   box install <owner/repo>        put the agent-box workflow on the repo's locked agent-box branch
   box up <owner/repo> [--minutes N]
                                   lease a runner; prints the lease id
-  box push <id> [--ref REF]       send HEAD (plus uncommitted changes to tracked files) or REF to ~/src
+  box push <id> [--ref REF] [--untracked] [--any-repo]
+                                  send the working tree of tracked files (or REF's tree) to ~/src
+                                  as one commit without history
   box run <id> <command>          run a command in ~/src and return its exit code
   box ssh <id>                    interactive shell
   box down <id>                   release the runner and its tunnel
