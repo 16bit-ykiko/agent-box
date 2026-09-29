@@ -539,6 +539,7 @@ async function run(args: string[]) {
     });
     if (stopping) return;
     if (status === 0) break;
+    if (!fs.existsSync(sshConfig(l.id))) die(`lease ${l.id} was released`);
     if (received || Date.now() - attempt > 30_000) failingSince = undefined;
     failingSince ??= attempt;
     if (Date.now() - failingSince > 10 * 60_000) die("lost the box for 10 minutes; the command may still be running");
