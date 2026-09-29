@@ -30,7 +30,7 @@ jobs:
             [ -n "$host" ] && break; sleep 1
           done
           [ -n "$host" ] || { cat ~/cf.log; exit 1; }
-          printf 'host=%s\nuser=%s\n' "${host#https://}" "$USER" | tee ~/box.txt
+          printf 'host=%s\nuser=%s\n' "${host#https://}" "$USER" > ~/box.txt
       - uses: actions/upload-artifact@v4
         with:
           name: box
