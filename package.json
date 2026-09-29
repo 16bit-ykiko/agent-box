@@ -1,0 +1,8 @@
+{
+  "name": "agent-box",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "box": "box.ts"
+  }
+}

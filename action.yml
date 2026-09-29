@@ -1,0 +1,31 @@
+name: agent-box
+description: Keep this runner open for ssh over a Cloudflare tunnel until stopped, idle or timed out.
+inputs:
+  pubkey:
+    description: The only ssh key allowed to log in (one ssh-ed25519 public key)
+    required: true
+  minutes:
+    description: Maximum lifetime in minutes
+    default: "340"
+  idle-minutes:
+    description: Stop after this many minutes without an ssh connection
+    default: "60"
+runs:
+  using: composite
+  steps:
+    - name: start sshd and tunnel
+      shell: bash
+      env:
+        PUBKEY: ${{ inputs.pubkey }}
+      run: bash "$GITHUB_ACTION_PATH/runner/start.sh"
+    - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      with:
+        name: box
+        path: ~/.box/box.json
+        retention-days: 1
+    - name: hold
+      shell: bash
+      env:
+        MINUTES: ${{ inputs.minutes }}
+        IDLE_MINUTES: ${{ inputs.idle-minutes }}
+      run: bash "$GITHUB_ACTION_PATH/runner/hold.sh"
