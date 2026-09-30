@@ -354,11 +354,41 @@ async function up(args: string[]) {
   if (!OSES.includes(target)) die(`--os must be one of ${OSES.join(", ")}`);
   const minutes = flag(args, "--minutes") ?? "340";
   if (!/^\d+$/.test(minutes) || +minutes < 5 || +minutes > 340) die("--minutes must be 5..340");
+  const cpuFlag = flag(args, "--cpu");
+  const cpu = cpuFlag ? new RegExp(cpuFlag, "i") : undefined;
+  const tries = +(flag(args, "--tries") ?? "3");
+  if (!Number.isInteger(tries) || tries < 1 || tries > 10) die("--tries must be 1..10");
   const c = config();
   ensureState();
   await ensureCloudflared();
   const tip = verifyBranch(repo, c.owner);
 
+  // Hosted runners come on a mix of CPU generations; --cpu keeps leasing until one matches.
+  for (let attempt = 1; ; attempt++) {
+    const l = await lease(repo, target, minutes, c, tip);
+    const model = cpuOf(l);
+    if (!cpu || cpu.test(model) || attempt >= tries) {
+      if (cpu && !cpu.test(model)) log(`${l.id}: no ${cpuFlag} in ${tries} tries, keeping ${model}`);
+      log(`${l.id}: ready on ${l.host} (${l.repo} on ${target}, ${model}, up to ${minutes} min, stops after 60 min idle)`);
+      console.log(l.id);
+      return;
+    }
+    log(`${l.id}: got ${model}, trying again for ${cpuFlag}`);
+    await release(l).catch((e: Error) => log(`${l.id}: ${e.message}; retry with \`box down ${l.id}\``));
+  }
+}
+
+function cpuOf(l: Lease) {
+  const probe = [
+    "lscpu 2>/dev/null | sed -n 's/^Model name: *//p'",
+    "sysctl -n machdep.cpu.brand_string 2>/dev/null",
+    'powershell.exe -NoProfile -Command "(Get-CimInstance Win32_Processor).Name" 2>/dev/null',
+  ].join("; ");
+  const name = (ssh(l, `(${probe}) | head -1; nproc 2>/dev/null || sysctl -n hw.ncpu`, { timeout: 60_000 }).stdout ?? "").split("\n");
+  return `${clean(name[0] ?? "").trim() || "unknown CPU"}, ${clean(name[1] ?? "").trim()} vCPU`;
+}
+
+async function lease(repo: string, target: string, minutes: string, c: Config, tip: string): Promise<Lease> {
   const l: Lease = { id: randomBytes(5).toString("hex"), repo, os: target, created: new Date().toISOString() };
   const dir = leaseDir(l.id);
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
@@ -420,8 +450,7 @@ async function up(args: string[]) {
     await release(l).catch((e: Error) => log(`${l.id}: ${e.message}; retry with \`box down ${l.id}\``));
     process.exit(1);
   }
-  log(`${l.id}: ready on ${l.host} (${l.repo} on ${target}, up to ${minutes} min, stops after 60 min idle)`);
-  console.log(l.id);
+  return l;
 }
 
 const git = (args: string[], env?: NodeJS.ProcessEnv) =>
@@ -724,6 +753,7 @@ function positional(args: string[]) {
 const USAGE = `usage:
   box install <owner/repo>        put the agent-box workflow on the repo's locked agent-box branch
   box up <owner/repo> [--os linux|linux-arm|macos|macos-intel|windows|windows-arm] [--minutes N]
+         [--cpu REGEX [--tries N]]   lease again until the CPU model matches (default 3 tries)
                                   lease a runner; prints the lease id
   box push <id> [--ref REF] [--untracked] [--any-repo]
                                   send the working tree of tracked files (or REF's tree) to ~/src
