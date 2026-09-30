@@ -13,7 +13,8 @@ case $1 in
     d=$2
     cat > "$d/run.sh" <<'RUN'
 d=$(dirname "$0")
-echo $$ > "$d/pid"
+echo $ > "$d/pid"
+[[ -f ~/.box/env ]] && . ~/.box/env
 cd -P ~/src 2>/dev/null || cd ~
 bash "$d/cmd" > "$d/log" 2>&1 < /dev/null
 echo $? > "$d/exit"

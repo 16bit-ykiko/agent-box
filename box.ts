@@ -572,7 +572,7 @@ async function run(args: string[]) {
 
 function shell(args: string[]) {
   const l = loadLease(args[0]);
-  const r = spawnSync("ssh", ["-F", sshConfig(l.id), "-t", "box", "cd -P ~/src 2>/dev/null; exec bash -l"], { stdio: "inherit" });
+  const r = spawnSync("ssh", ["-F", sshConfig(l.id), "-t", "box", "cd -P ~/src 2>/dev/null; exec bash --rcfile ~/.box/bashrc -i"], { stdio: "inherit" });
   process.exit(r.status ?? 255);
 }
 

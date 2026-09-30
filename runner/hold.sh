@@ -21,6 +21,13 @@ job_running() {
   return 1
 }
 
+# Sessions get the environment a CI step has here: the workflow's env, PATH from setup steps.
+for name in $(compgen -e); do
+  [[ $name =~ ^(ACTIONS_|INPUT_|STATE_|GITHUB_(TOKEN|OUTPUT|ENV|PATH|STATE|STEP_SUMMARY|ACTION))|TOKEN|SECRET|PASSWORD|^(PUBKEY|MINUTES|IDLE_MINUTES|HOME|PWD|OLDPWD|SHLVL|USER|LOGNAME|SHELL|_)$ ]] ||
+    declare -p "$name"
+done > "$box/env"
+printf '[[ -f ~/.bashrc ]] && . ~/.bashrc\n. ~/.box/env\n' > "$box/bashrc"
+
 touch "$box/active"
 end=$((SECONDS + MINUTES * 60))
 while ((SECONDS < end)); do
