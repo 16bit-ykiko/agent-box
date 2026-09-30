@@ -47,15 +47,16 @@ if [[ $(uname -s) == Linux ]]; then sudo mkdir -p /run/sshd; fi
 sudo /usr/sbin/sshd -t -f /etc/agent-box/sshd_config
 sudo /usr/sbin/sshd -f /etc/agent-box/sshd_config
 
+# The published checksums are of the binary, also for the macOS archives.
 curl -fsSL --retry 3 -o "$box/$asset" \
   "https://github.com/cloudflare/cloudflared/releases/download/$CLOUDFLARED_VERSION/$asset"
-actual=$( (sha256sum "$box/$asset" 2>/dev/null || shasum -a 256 "$box/$asset") | grep -oE '[0-9a-f]{64}' | head -1)
-[[ $actual == "$sum" ]] || { echo "cloudflared checksum mismatch"; exit 1; }
 if [[ $asset == *.tgz ]]; then
-  tar -xzf "$box/$asset" -C "$box" && rm "$box/$asset"
+  tar -xzf "$box/$asset" -C "$box" cloudflared && rm "$box/$asset"
 else
   mv "$box/$asset" "$box/cloudflared"
 fi
+actual=$( (sha256sum "$box/cloudflared" 2>/dev/null || shasum -a 256 "$box/cloudflared") | grep -oE '[0-9a-f]{64}' | head -1)
+[[ $actual == "$sum" ]] || { echo "cloudflared checksum mismatch"; exit 1; }
 chmod +x "$box/cloudflared"
 
 nohup "$box/cloudflared" tunnel --no-autoupdate --url ssh://127.0.0.1:2222 > "$box/quick.log" 2>&1 < /dev/null &

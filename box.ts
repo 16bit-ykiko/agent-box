@@ -251,7 +251,7 @@ async function upgradeToNamed(l: Lease, c: Config, token: string, user: string) 
   const start = [
     "set -e; umask 077; t=$(cat)",
     DETACH,
-    'TUNNEL_TOKEN="$t" detach nohup ~/.box/cloudflared tunnel --no-autoupdate run > ~/.box/named.log 2>&1 < /dev/null &',
+    'TUNNEL_TOKEN="$t" "${detach[@]}" nohup ~/.box/cloudflared tunnel --no-autoupdate run > ~/.box/named.log 2>&1 < /dev/null &',
     "echo $! > ~/.box/named.pid",
     "for i in $(seq 60); do grep -q 'Registered tunnel connection' ~/.box/named.log && exit 0; sleep 1; done; exit 1",
   ].join("\n");
@@ -500,8 +500,10 @@ const CONTROL =
 const clean = (s: string) => s.replace(CONTROL, "").replace(/\r(?!\n)/g, "\n");
 
 // A new session, so the whole job can be killed as a group; macOS and Git Bash lack setsid.
+// An array, not a function: a backgrounded function runs in a subshell, and $! would be the
+// subshell instead of the session leader.
 const DETACH =
-  'detach() { if command -v setsid >/dev/null; then setsid "$@"; else perl -MPOSIX -e \'POSIX::setsid(); exec @ARGV or die\' -- "$@"; fi; }';
+  "if command -v setsid >/dev/null; then detach=(setsid); else detach=(perl -MPOSIX -e 'POSIX::setsid(); exec @ARGV or die' --); fi";
 
 // The command runs detached on the box, so a dropped tunnel only interrupts the output: the
 // follower reconnects and resumes from the last byte it saw.
@@ -516,7 +518,7 @@ async function run(args: string[]) {
       `d=${job}; mkdir -p $d && cat > $d/cmd && : > $d/log || exit 1`,
       DETACH,
       "cd ~/src 2>/dev/null",
-      `detach nohup bash -c 'bash "$0"/cmd > "$0"/log 2>&1 < /dev/null; echo $? > "$0"/exit' "$d" > /dev/null 2>&1 < /dev/null &`,
+      `"\${detach[@]}" nohup bash -c 'bash "$0"/cmd > "$0"/log 2>&1 < /dev/null; echo $? > "$0"/exit' "$d" > /dev/null 2>&1 < /dev/null &`,
       "echo $! > $d/pid; cat $d/pid",
     ].join("\n"),
     { input: command, timeout: 60_000 },
