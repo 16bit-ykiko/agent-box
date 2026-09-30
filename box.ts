@@ -16,12 +16,14 @@ const BRANCH = "agent-box";
 const WORKFLOW = ".github/workflows/agent-box.yml";
 const HOME = os.homedir();
 const STATE = path.join(process.env.XDG_STATE_HOME ?? path.join(HOME, ".local/state"), "agent-box");
+const OSES = ["linux", "linux-arm", "macos", "macos-intel", "windows"];
 const CLOUDFLARED = { version: "2026.9.3", sha256: "77e26d8d900e0b8469f416239d14b5f296525fdf79fee6f511ef55609e3fbac2" };
 
 type Config = { owner: string; zone?: string; cloudflareTokenFile: string };
 type Lease = {
   id: string;
   repo: string;
+  os: string;
   created: string;
   runId?: number;
   host?: string;
@@ -248,7 +250,8 @@ async function upgradeToNamed(l: Lease, c: Config, token: string, user: string) 
 
   const start = [
     "set -e; umask 077; t=$(cat)",
-    'TUNNEL_TOKEN="$t" setsid nohup ~/.box/cloudflared tunnel --no-autoupdate run > ~/.box/named.log 2>&1 < /dev/null &',
+    DETACH,
+    'TUNNEL_TOKEN="$t" detach nohup ~/.box/cloudflared tunnel --no-autoupdate run > ~/.box/named.log 2>&1 < /dev/null &',
     "echo $! > ~/.box/named.pid",
     "for i in $(seq 60); do grep -q 'Registered tunnel connection' ~/.box/named.log && exit 0; sleep 1; done; exit 1",
   ].join("\n");
@@ -334,7 +337,9 @@ function parseBoxJson(dir: string) {
 
 async function up(args: string[]) {
   const [repo] = positional(args);
-  if (!repo || !/^[\w.-]+\/[\w.-]+$/.test(repo)) die("usage: box up <owner/repo> [--minutes N]");
+  if (!repo || !/^[\w.-]+\/[\w.-]+$/.test(repo)) die("usage: box up <owner/repo> [--os OS] [--minutes N]");
+  const target = flag(args, "--os") ?? "linux";
+  if (!OSES.includes(target)) die(`--os must be one of ${OSES.join(", ")}`);
   const minutes = flag(args, "--minutes") ?? "340";
   if (!/^\d+$/.test(minutes) || +minutes < 5 || +minutes > 340) die("--minutes must be 5..340");
   const c = config();
@@ -342,7 +347,7 @@ async function up(args: string[]) {
   await ensureCloudflared();
   const tip = verifyBranch(repo, c.owner);
 
-  const l: Lease = { id: randomBytes(5).toString("hex"), repo, created: new Date().toISOString() };
+  const l: Lease = { id: randomBytes(5).toString("hex"), repo, os: target, created: new Date().toISOString() };
   const dir = leaseDir(l.id);
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   execFileSync("ssh-keygen", ["-q", "-t", "ed25519", "-N", "", "-C", `agent-box-${l.id}`, "-f", `${dir}/id_ed25519`]);
@@ -350,7 +355,7 @@ async function up(args: string[]) {
 
   try {
     const pubkey = fs.readFileSync(`${dir}/id_ed25519.pub`, "utf8").trim();
-    gh(["workflow", "run", "agent-box.yml", "-R", l.repo, "--ref", BRANCH, "-f", `lease=${l.id}`, "-f", `pubkey=${pubkey}`, "-f", `minutes=${minutes}`], {
+    gh(["workflow", "run", "agent-box.yml", "-R", l.repo, "--ref", BRANCH, "-f", `lease=${l.id}`, "-f", `pubkey=${pubkey}`, "-f", `minutes=${minutes}`, "-f", `os=${target}`], {
       retry: false,
     });
     log(`${l.id}: dispatched on ${l.repo}, waiting for a runner`);
@@ -403,7 +408,7 @@ async function up(args: string[]) {
     await release(l).catch((e: Error) => log(`${l.id}: ${e.message}; retry with \`box down ${l.id}\``));
     process.exit(1);
   }
-  log(`${l.id}: ready on ${l.host} (${l.repo}, up to ${minutes} min, stops after 60 min idle)`);
+  log(`${l.id}: ready on ${l.host} (${l.repo} on ${target}, up to ${minutes} min, stops after 60 min idle)`);
   console.log(l.id);
 }
 
@@ -494,6 +499,10 @@ const CONTROL =
   /\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-_]|[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\u0080-\u009f]|\p{Cf}/gu;
 const clean = (s: string) => s.replace(CONTROL, "").replace(/\r(?!\n)/g, "\n");
 
+// A new session, so the whole job can be killed as a group; macOS and Git Bash lack setsid.
+const DETACH =
+  'detach() { if command -v setsid >/dev/null; then setsid "$@"; else perl -MPOSIX -e \'POSIX::setsid(); exec @ARGV or die\' -- "$@"; fi; }';
+
 // The command runs detached on the box, so a dropped tunnel only interrupts the output: the
 // follower reconnects and resumes from the last byte it saw.
 async function run(args: string[]) {
@@ -503,12 +512,26 @@ async function run(args: string[]) {
   const job = `~/.box/jobs/${randomBytes(4).toString("hex")}`;
   const start = ssh(
     l,
-    `mkdir -p ${job} && cat > ${job}/cmd && cd ~/src 2>/dev/null; ` +
-      `setsid nohup bash -c 'bash ${job}/cmd > ${job}/log 2>&1 < /dev/null; echo $? > ${job}/exit' > /dev/null 2>&1 < /dev/null & echo $!`,
+    [
+      `d=${job}; mkdir -p $d && cat > $d/cmd && : > $d/log || exit 1`,
+      DETACH,
+      "cd ~/src 2>/dev/null",
+      `detach nohup bash -c 'bash "$0"/cmd > "$0"/log 2>&1 < /dev/null; echo $? > "$0"/exit' "$d" > /dev/null 2>&1 < /dev/null &`,
+      "echo $! > $d/pid; cat $d/pid",
+    ].join("\n"),
     { input: command, timeout: 60_000 },
   );
   const pid = /^(\d+)\s*$/.exec(start.stdout ?? "")?.[1];
   if (start.status !== 0 || !pid) die(`cannot start the command: ${clean(start.stderr ?? "")}`);
+  // tail --pid is GNU only; this follows the log until the job ends on every platform, and
+  // exits non-zero if the tail died first (the connection went away).
+  const follow = (offset: number) =>
+    [
+      `tail -c +${offset + 1} -f ${job}/log & t=$!`,
+      `while kill -0 ${pid} 2>/dev/null && kill -0 $t 2>/dev/null; do touch ~/.box/active; sleep 1; done`,
+      `if kill -0 ${pid} 2>/dev/null; then kill $t 2>/dev/null; exit 1; fi`,
+      "sleep 2; kill $t 2>/dev/null; exit 0",
+    ].join("\n");
 
   let stopping = false;
   const stop = (code: number) => {
@@ -527,7 +550,7 @@ async function run(args: string[]) {
     const attempt = Date.now();
     let received = false;
     const status = await new Promise<number | null>((resolve) => {
-      const child = spawn("ssh", ["-F", sshConfig(l.id), "box", `tail -c +${offset + 1} --pid=${pid} -f ${job}/log`], {
+      const child = spawn("ssh", ["-F", sshConfig(l.id), "box", follow(offset)], {
         stdio: ["ignore", "pipe", "ignore"],
       });
       child.stdout.on("data", (chunk: Buffer) => {
@@ -588,7 +611,7 @@ function runStatus(l: Lease) {
 function ls() {
   for (const l of allLeases()) {
     const age = Math.round((Date.now() - Date.parse(l.created)) / 60_000);
-    console.log(`${l.id}  ${l.repo.padEnd(28)} ${String(age).padStart(4)} min  ${runStatus(l).padEnd(14)} ${l.host ?? "-"}`);
+    console.log(`${l.id}  ${l.repo.padEnd(28)} ${(l.os ?? "linux").padEnd(12)}${String(age).padStart(4)} min  ${runStatus(l).padEnd(14)} ${l.host ?? "-"}`);
   }
 }
 
@@ -683,7 +706,7 @@ function positional(args: string[]) {
 
 const USAGE = `usage:
   box install <owner/repo>        put the agent-box workflow on the repo's locked agent-box branch
-  box up <owner/repo> [--minutes N]
+  box up <owner/repo> [--os linux|linux-arm|macos|macos-intel|windows] [--minutes N]
                                   lease a runner; prints the lease id
   box push <id> [--ref REF] [--untracked] [--any-repo]
                                   send the working tree of tracked files (or REF's tree) to ~/src

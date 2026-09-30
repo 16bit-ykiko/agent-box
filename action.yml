@@ -8,16 +8,23 @@ inputs:
     description: Maximum lifetime in minutes
     default: "340"
   idle-minutes:
-    description: Stop after this many minutes without an ssh connection
+    description: Stop after this many minutes without an ssh connection or a running job
     default: "60"
 runs:
   using: composite
   steps:
     - name: start sshd and tunnel
+      if: runner.os != 'Windows'
       shell: bash
       env:
         PUBKEY: ${{ inputs.pubkey }}
       run: bash "$GITHUB_ACTION_PATH/runner/start.sh"
+    - name: start sshd and tunnel
+      if: runner.os == 'Windows'
+      shell: pwsh
+      env:
+        PUBKEY: ${{ inputs.pubkey }}
+      run: '& "$env:GITHUB_ACTION_PATH/runner/start.ps1"'
     - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
       with:
         name: box
