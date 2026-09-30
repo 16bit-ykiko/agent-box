@@ -49,7 +49,7 @@ sudo /usr/sbin/sshd -f /etc/agent-box/sshd_config
 
 curl -fsSL --retry 3 -o "$box/$asset" \
   "https://github.com/cloudflare/cloudflared/releases/download/$CLOUDFLARED_VERSION/$asset"
-actual=$( (sha256sum "$box/$asset" 2>/dev/null || shasum -a 256 "$box/$asset") | cut -d' ' -f1)
+actual=$( (sha256sum "$box/$asset" 2>/dev/null || shasum -a 256 "$box/$asset") | grep -oE '[0-9a-f]{64}' | head -1)
 [[ $actual == "$sum" ]] || { echo "cloudflared checksum mismatch"; exit 1; }
 if [[ $asset == *.tgz ]]; then
   tar -xzf "$box/$asset" -C "$box" && rm "$box/$asset"

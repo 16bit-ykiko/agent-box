@@ -16,17 +16,18 @@ $box = Join-Path $HOME '.box'
 $etc = 'C:\ProgramData\agent-box'
 New-Item -ItemType Directory -Force $box, $etc | Out-Null
 
-# Windows sshd refuses keys that anyone but SYSTEM, Administrators and the user can touch.
-function Lock([string]$path) {
+# Windows sshd refuses key files that anyone but SYSTEM and Administrators (and, for
+# authorized_keys, the user) can read.
+function Lock([string]$path, [string[]]$readers = @()) {
   icacls $path /setowner Administrators | Out-Null
-  icacls $path /inheritance:r /grant:r 'SYSTEM:(F)' 'Administrators:(F)' "${user}:(R)" | Out-Null
+  icacls $path /inheritance:r /grant:r 'SYSTEM:(F)' 'Administrators:(F)' @($readers | ForEach-Object { "${_}:(R)" }) | Out-Null
 }
 
 ssh-keygen -q -t ed25519 -N '' -C agent-box -f "$etc\host_key"
 if ($LASTEXITCODE -ne 0) { throw 'ssh-keygen failed' }
 Lock "$etc\host_key"
 Set-Content -Encoding ascii -Path "$etc\authorized_keys" -Value "restrict,pty $env:PUBKEY"
-Lock "$etc\authorized_keys"
+Lock "$etc\authorized_keys" $user
 
 Set-Content -Encoding ascii -Path 'C:\ProgramData\ssh\sshd_config' -Value @"
 Port 2222
@@ -46,7 +47,13 @@ PermitTunnel no
 PermitUserEnvironment no
 "@
 New-ItemProperty -Path 'HKLM:\SOFTWARE\OpenSSH' -Name DefaultShell -Value 'C:\Program Files\Git\bin\bash.exe' -PropertyType String -Force | Out-Null
-Restart-Service sshd
+$check = & "$env:WINDIR\System32\OpenSSH\sshd.exe" -t 2>&1
+if ($LASTEXITCODE -ne 0) { throw "sshd_config rejected: $check" }
+try { Restart-Service sshd }
+catch {
+  Get-WinEvent -LogName 'OpenSSH/Operational' -MaxEvents 10 -ErrorAction SilentlyContinue | Format-List TimeCreated, Message | Out-String | Write-Host
+  throw
+}
 for ($i = 0; -not (Get-NetTCPConnection -LocalAddress 127.0.0.1 -LocalPort 2222 -State Listen -ErrorAction SilentlyContinue); $i++) {
   if ($i -ge 30) { throw 'sshd is not listening on 127.0.0.1:2222' }
   Start-Sleep 1
