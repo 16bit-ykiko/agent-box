@@ -12,14 +12,18 @@ on:
         required: true
       minutes:
         default: "340"
+      os:
+        type: choice
+        default: linux
+        options: [linux, linux-arm, macos, macos-intel, windows]
 permissions: {}
 jobs:
   box:
     if: github.event_name == 'workflow_dispatch' && github.actor == '16bit-ykiko' && github.triggering_actor == '16bit-ykiko'
-    runs-on: ubuntu-24.04
+    runs-on: ${{ fromJSON('{"linux":"ubuntu-24.04","linux-arm":"ubuntu-24.04-arm","macos":"macos-15","macos-intel":"macos-15-intel","windows":"windows-2025"}')[inputs.os] || 'ubuntu-24.04' }}
     timeout-minutes: 350
     steps:
-      - uses: 16bit-ykiko/agent-box@47ee17ab9627dd60d54a9356c5e3181c7293bcf5
+      - uses: 16bit-ykiko/agent-box@69cd9706ef4a36531c3695a50abf45313dd675ef
         with:
           pubkey: ${{ inputs.pubkey }}
           minutes: ${{ inputs.minutes }}
