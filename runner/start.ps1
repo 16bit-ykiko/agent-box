@@ -61,7 +61,18 @@ New-ItemProperty -Path 'HKLM:\SOFTWARE\OpenSSH' -Name DefaultShell -Value 'C:\Pr
 Lock "$etc\sshd_config"
 Stop-Service sshd -ErrorAction SilentlyContinue
 $sshd = "$env:WINDIR\System32\OpenSSH\sshd.exe"
-if (-not (Test-Path $sshd)) { Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0 | Out-Null }
+if (-not (Test-Path $sshd)) {
+  # The Arm image has no OpenSSH Server, and installing the Windows capability takes over ten
+  # minutes; the same 9.5 release as a portable zip takes seconds.
+  $zip = @{
+    ARM64 = @{ name = 'OpenSSH-ARM64'; sha256 = 'e6a7e39266485eb98ce5396c61a9931e7826502c71bf5234dfdda5bee3882f23' }
+    AMD64 = @{ name = 'OpenSSH-Win64'; sha256 = 'bd48fe985d400402c278c485db20e6a82bc4c7f7d8e0ef5a81128f523096530c' }
+  }[$env:PROCESSOR_ARCHITECTURE]
+  Invoke-WebRequest -UseBasicParsing -OutFile "$etc\openssh.zip" "https://github.com/PowerShell/Win32-OpenSSH/releases/download/v9.5.0.0p1-Beta/$($zip.name).zip"
+  if ((Get-FileHash -Algorithm SHA256 "$etc\openssh.zip").Hash.ToLowerInvariant() -ne $zip.sha256) { throw 'OpenSSH checksum mismatch' }
+  Expand-Archive "$etc\openssh.zip" $etc -Force
+  $sshd = "$etc\$($zip.name)\sshd.exe"
+}
 $check = & $sshd -t -f "$etc\sshd_config" 2>&1
 if ($LASTEXITCODE -ne 0) { throw "sshd_config rejected: $check" }
 Set-Content -Path "$box\sshd.pid" -Value (Spawn "`"$sshd`" -f `"$etc\sshd_config`" -E `"$box\sshd.log`"")
@@ -70,7 +81,7 @@ for ($i = 0; -not (Get-NetTCPConnection -LocalAddress 127.0.0.1 -LocalPort 2222 
   Start-Sleep 1
 }
 
-# There is no arm64 build; Windows on Arm runs this one emulated.
+# cloudflared has no arm64 build; Windows on Arm runs this one emulated.
 $exe = "$box\cloudflared.exe"
 Invoke-WebRequest -UseBasicParsing -OutFile $exe "https://github.com/cloudflare/cloudflared/releases/download/$version/cloudflared-windows-amd64.exe"
 if ((Get-FileHash -Algorithm SHA256 $exe).Hash.ToLowerInvariant() -ne $sha256) { throw 'cloudflared checksum mismatch' }
