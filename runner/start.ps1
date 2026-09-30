@@ -16,6 +16,8 @@ if ($user -cnotmatch '^[a-z_][a-z0-9_-]*$') { throw "unexpected user name $user"
 $box = Join-Path $HOME '.box'
 $etc = 'C:\ProgramData\agent-box'
 New-Item -ItemType Directory -Force $box, $etc | Out-Null
+Copy-Item "$PSScriptRoot\job.sh" "$box\job"
+Copy-Item "$PSScriptRoot\spawn.ps1" "$box\spawn.ps1"
 
 # The runner ends every process a step started when the step ends; processes created through
 # WMI are not the step's, so sshd and cloudflared outlive this step.

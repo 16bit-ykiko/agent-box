@@ -248,12 +248,15 @@ async function upgradeToNamed(l: Lease, c: Config, token: string, user: string) 
   saveLease(l);
   const tunnelToken = await cf<string>(token, `/accounts/${accountId}/cfd_tunnel/${tunnel.id}/token`);
 
+  // Outside ~/.box/jobs, which keeps the box from idling out.
   const start = [
-    "set -e; umask 077; t=$(cat)",
-    DETACH,
-    'TUNNEL_TOKEN="$t" "${detach[@]}" nohup ~/.box/cloudflared tunnel --no-autoupdate run > ~/.box/named.log 2>&1 < /dev/null &',
-    "echo $! > ~/.box/named.pid",
-    "for i in $(seq 60); do grep -q 'Registered tunnel connection' ~/.box/named.log && exit 0; sleep 1; done; exit 1",
+    "set -e; umask 077; d=~/.box/named; mkdir -p $d; cat > $d/token; : > $d/log",
+    "cat > $d/cmd <<'CMD'",
+    "t=$(cat ~/.box/named/token); rm -f ~/.box/named/token",
+    'TUNNEL_TOKEN="$t" exec ~/.box/cloudflared tunnel --no-autoupdate run',
+    "CMD",
+    "bash ~/.box/job start $d > /dev/null",
+    "for i in $(seq 60); do grep -q 'Registered tunnel connection' $d/log && exit 0; sleep 1; done; exit 1",
   ].join("\n");
   const r = ssh(l, start, { input: tunnelToken, timeout: 90_000 });
   if (r.status !== 0) throw new Error("named tunnel did not come up on the runner");
@@ -263,7 +266,7 @@ async function upgradeToNamed(l: Lease, c: Config, token: string, user: string) 
   await waitForSsh(l, 60);
   l.host = host;
   saveLease(l);
-  ssh(l, "kill $(cat ~/.box/quick.pid) 2>/dev/null; true", { timeout: 20_000 });
+  ssh(l, "bash ~/.box/job untunnel", { timeout: 20_000 });
 }
 
 // ---------------------------------------------------------------- workflow on the repo
@@ -499,12 +502,6 @@ const CONTROL =
   /\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-_]|[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\u0080-\u009f]|\p{Cf}/gu;
 const clean = (s: string) => s.replace(CONTROL, "").replace(/\r(?!\n)/g, "\n");
 
-// A new session, so the whole job can be killed as a group; macOS and Git Bash lack setsid.
-// An array, not a function: a backgrounded function runs in a subshell, and $! would be the
-// subshell instead of the session leader.
-const DETACH =
-  "if command -v setsid >/dev/null; then detach=(setsid); else detach=(perl -MPOSIX -e 'POSIX::setsid(); exec @ARGV or die' --); fi";
-
 // The command runs detached on the box, so a dropped tunnel only interrupts the output: the
 // follower reconnects and resumes from the last byte it saw.
 async function run(args: string[]) {
@@ -514,13 +511,7 @@ async function run(args: string[]) {
   const job = `~/.box/jobs/${randomBytes(4).toString("hex")}`;
   const start = ssh(
     l,
-    [
-      `d=${job}; mkdir -p $d && cat > $d/cmd && : > $d/log || exit 1`,
-      DETACH,
-      "cd ~/src 2>/dev/null",
-      `"\${detach[@]}" nohup bash -c 'bash "$0"/cmd > "$0"/log 2>&1 < /dev/null; echo $? > "$0"/exit' "$d" > /dev/null 2>&1 < /dev/null &`,
-      "echo $! > $d/pid; cat $d/pid",
-    ].join("\n"),
+    `d=${job}; mkdir -p $d && cat > $d/cmd && : > $d/log && bash ~/.box/job start $d`,
     { input: command, timeout: 60_000 },
   );
   const pid = /^(\d+)\s*$/.exec(start.stdout ?? "")?.[1];
@@ -538,7 +529,7 @@ async function run(args: string[]) {
   let stopping = false;
   const stop = (code: number) => {
     stopping = true;
-    ssh(l, `kill -TERM -- -${pid} 2>/dev/null; true`, { timeout: 20_000 });
+    ssh(l, `bash ~/.box/job kill ${job}`, { timeout: 20_000 });
     process.exit(code);
   };
   process.on("SIGINT", () => stop(130));
