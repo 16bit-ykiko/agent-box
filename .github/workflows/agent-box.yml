@@ -16,6 +16,12 @@ on:
         type: choice
         default: linux
         options: [linux, linux-arm, macos, macos-intel, windows, windows-arm]
+      cache-path:
+        default: ""
+      cache-key:
+        default: ""
+      cache-restore-keys:
+        default: ""
 permissions: {}
 jobs:
   box:
@@ -23,7 +29,10 @@ jobs:
     runs-on: ${{ fromJSON('{"linux":"ubuntu-24.04","linux-arm":"ubuntu-24.04-arm","macos":"macos-15","macos-intel":"macos-15-intel","windows":"windows-2025","windows-arm":"windows-11-arm"}')[inputs.os] || 'ubuntu-24.04' }}
     timeout-minutes: 350
     steps:
-      - uses: 16bit-ykiko/agent-box@c22cd1ece246f6a6669fa6341a7d0358d7348ec9
+      - uses: 16bit-ykiko/agent-box@6f9ad5a8385c716a465d7cc2ab11dda8f477184a
         with:
           pubkey: ${{ inputs.pubkey }}
           minutes: ${{ inputs.minutes }}
+          cache-path: ${{ inputs.cache-path }}
+          cache-key: ${{ inputs.cache-key }}
+          cache-restore-keys: ${{ inputs.cache-restore-keys }}
