@@ -1,7 +1,8 @@
 # Windows. Nothing secret ever reaches this runner through GitHub: the only input is a public
 # key, and everything this script publishes (box.json) is public too.
-# The image ships OpenSSH Server as a running service; it is reconfigured to listen on
-# loopback only, with our host key, our authorized key and Git Bash as the login shell.
+# The image's OpenSSH service crashes when pointed at another config, so it is stopped and
+# sshd runs as this user instead (it can then only log in this user, which is all we need),
+# on loopback, with our host key, our authorized key and Git Bash as the login shell.
 $ErrorActionPreference = 'Stop'
 $version = '2026.9.3'
 $sha256 = 'f096265ec2fcbe9bb6e2d64268db167ced3fcbb83d894bdb9e2fcdb26f2ea7e2'
@@ -29,7 +30,7 @@ Lock "$etc\host_key"
 Set-Content -Encoding ascii -Path "$etc\authorized_keys" -Value "restrict,pty $env:PUBKEY"
 Lock "$etc\authorized_keys" $user
 
-Set-Content -Encoding ascii -Path 'C:\ProgramData\ssh\sshd_config' -Value @"
+Set-Content -Encoding ascii -Path "$etc\sshd_config" -Value @"
 Port 2222
 ListenAddress 127.0.0.1
 HostKey C:/ProgramData/agent-box/host_key
@@ -47,15 +48,15 @@ PermitTunnel no
 PermitUserEnvironment no
 "@
 New-ItemProperty -Path 'HKLM:\SOFTWARE\OpenSSH' -Name DefaultShell -Value 'C:\Program Files\Git\bin\bash.exe' -PropertyType String -Force | Out-Null
-$check = & "$env:WINDIR\System32\OpenSSH\sshd.exe" -t 2>&1
+Lock "$etc\sshd_config"
+Stop-Service sshd
+$sshd = "$env:WINDIR\System32\OpenSSH\sshd.exe"
+$check = & $sshd -t -f "$etc\sshd_config" 2>&1
 if ($LASTEXITCODE -ne 0) { throw "sshd_config rejected: $check" }
-try { Restart-Service sshd }
-catch {
-  Get-WinEvent -LogName 'OpenSSH/Operational' -MaxEvents 10 -ErrorAction SilentlyContinue | Format-List TimeCreated, Message | Out-String | Write-Host
-  throw
-}
+$d = Start-Process -FilePath $sshd -ArgumentList '-f', "$etc\sshd_config", '-E', "$box\sshd.log" -WindowStyle Hidden -PassThru
+Set-Content -Path "$box\sshd.pid" -Value $d.Id
 for ($i = 0; -not (Get-NetTCPConnection -LocalAddress 127.0.0.1 -LocalPort 2222 -State Listen -ErrorAction SilentlyContinue); $i++) {
-  if ($i -ge 30) { throw 'sshd is not listening on 127.0.0.1:2222' }
+  if ($i -ge 30) { Get-Content "$box\sshd.log" -ErrorAction SilentlyContinue; throw 'sshd is not listening on 127.0.0.1:2222' }
   Start-Sleep 1
 }
 
