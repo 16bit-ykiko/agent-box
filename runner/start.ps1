@@ -17,6 +17,14 @@ $box = Join-Path $HOME '.box'
 $etc = 'C:\ProgramData\agent-box'
 New-Item -ItemType Directory -Force $box, $etc | Out-Null
 
+# The runner ends every process a step started when the step ends; processes created through
+# WMI are not the step's, so sshd and cloudflared outlive this step.
+function Spawn([string]$commandLine) {
+  $r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = $commandLine; CurrentDirectory = $HOME }
+  if ($r.ReturnValue -ne 0) { throw "cannot start $commandLine ($($r.ReturnValue))" }
+  $r.ProcessId
+}
+
 # Windows sshd refuses key files that anyone but SYSTEM and Administrators (and, for
 # authorized_keys, the user) can read.
 function Lock([string]$path, [string[]]$readers = @()) {
@@ -53,8 +61,7 @@ Stop-Service sshd
 $sshd = "$env:WINDIR\System32\OpenSSH\sshd.exe"
 $check = & $sshd -t -f "$etc\sshd_config" 2>&1
 if ($LASTEXITCODE -ne 0) { throw "sshd_config rejected: $check" }
-$d = Start-Process -FilePath $sshd -ArgumentList '-f', "$etc\sshd_config", '-E', "$box\sshd.log" -WindowStyle Hidden -PassThru
-Set-Content -Path "$box\sshd.pid" -Value $d.Id
+Set-Content -Path "$box\sshd.pid" -Value (Spawn "`"$sshd`" -f `"$etc\sshd_config`" -E `"$box\sshd.log`"")
 for ($i = 0; -not (Get-NetTCPConnection -LocalAddress 127.0.0.1 -LocalPort 2222 -State Listen -ErrorAction SilentlyContinue); $i++) {
   if ($i -ge 30) { Get-Content "$box\sshd.log" -ErrorAction SilentlyContinue; throw 'sshd is not listening on 127.0.0.1:2222' }
   Start-Sleep 1
@@ -64,9 +71,7 @@ $exe = "$box\cloudflared.exe"
 Invoke-WebRequest -UseBasicParsing -OutFile $exe "https://github.com/cloudflare/cloudflared/releases/download/$version/cloudflared-windows-amd64.exe"
 if ((Get-FileHash -Algorithm SHA256 $exe).Hash.ToLowerInvariant() -ne $sha256) { throw 'cloudflared checksum mismatch' }
 
-$p = Start-Process -FilePath $exe -ArgumentList 'tunnel', '--no-autoupdate', '--url', 'ssh://127.0.0.1:2222' `
-  -RedirectStandardError "$box\quick.log" -RedirectStandardOutput "$box\quick.out" -WindowStyle Hidden -PassThru
-Set-Content -Path "$box\quick.pid" -Value $p.Id
+Set-Content -Path "$box\quick.pid" -Value (Spawn "`"$exe`" tunnel --no-autoupdate --logfile `"$box\quick.log`" --url ssh://127.0.0.1:2222")
 $tunnel = $null
 for ($i = 0; $i -lt 90 -and -not $tunnel; $i++) {
   Start-Sleep 1
