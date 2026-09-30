@@ -16,7 +16,7 @@ const BRANCH = "agent-box";
 const WORKFLOW = ".github/workflows/agent-box.yml";
 const HOME = os.homedir();
 const STATE = path.join(process.env.XDG_STATE_HOME ?? path.join(HOME, ".local/state"), "agent-box");
-const OSES = ["linux", "linux-arm", "macos", "macos-intel", "windows"];
+const OSES = ["linux", "linux-arm", "macos", "macos-intel", "windows", "windows-arm"];
 const CLOUDFLARED = { version: "2026.9.3", sha256: "77e26d8d900e0b8469f416239d14b5f296525fdf79fee6f511ef55609e3fbac2" };
 
 type Config = { owner: string; zone?: string; cloudflareTokenFile: string };
@@ -699,7 +699,7 @@ function positional(args: string[]) {
 
 const USAGE = `usage:
   box install <owner/repo>        put the agent-box workflow on the repo's locked agent-box branch
-  box up <owner/repo> [--os linux|linux-arm|macos|macos-intel|windows] [--minutes N]
+  box up <owner/repo> [--os linux|linux-arm|macos|macos-intel|windows|windows-arm] [--minutes N]
                                   lease a runner; prints the lease id
   box push <id> [--ref REF] [--untracked] [--any-repo]
                                   send the working tree of tracked files (or REF's tree) to ~/src

@@ -15,12 +15,12 @@ on:
       os:
         type: choice
         default: linux
-        options: [linux, linux-arm, macos, macos-intel, windows]
+        options: [linux, linux-arm, macos, macos-intel, windows, windows-arm]
 permissions: {}
 jobs:
   box:
     if: github.event_name == 'workflow_dispatch' && github.actor == '@OWNER@' && github.triggering_actor == '@OWNER@'
-    runs-on: ${{ fromJSON('{"linux":"ubuntu-24.04","linux-arm":"ubuntu-24.04-arm","macos":"macos-15","macos-intel":"macos-15-intel","windows":"windows-2025"}')[inputs.os] || 'ubuntu-24.04' }}
+    runs-on: ${{ fromJSON('{"linux":"ubuntu-24.04","linux-arm":"ubuntu-24.04-arm","macos":"macos-15","macos-intel":"macos-15-intel","windows":"windows-2025","windows-arm":"windows-11-arm"}')[inputs.os] || 'ubuntu-24.04' }}
     timeout-minutes: 350
     steps:
       - uses: @ACTION@@@SHA@

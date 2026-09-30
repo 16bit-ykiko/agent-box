@@ -59,8 +59,9 @@ PermitUserEnvironment no
 "@
 New-ItemProperty -Path 'HKLM:\SOFTWARE\OpenSSH' -Name DefaultShell -Value 'C:\Program Files\Git\bin\bash.exe' -PropertyType String -Force | Out-Null
 Lock "$etc\sshd_config"
-Stop-Service sshd
+Stop-Service sshd -ErrorAction SilentlyContinue
 $sshd = "$env:WINDIR\System32\OpenSSH\sshd.exe"
+if (-not (Test-Path $sshd)) { Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0 | Out-Null }
 $check = & $sshd -t -f "$etc\sshd_config" 2>&1
 if ($LASTEXITCODE -ne 0) { throw "sshd_config rejected: $check" }
 Set-Content -Path "$box\sshd.pid" -Value (Spawn "`"$sshd`" -f `"$etc\sshd_config`" -E `"$box\sshd.log`"")
@@ -69,6 +70,7 @@ for ($i = 0; -not (Get-NetTCPConnection -LocalAddress 127.0.0.1 -LocalPort 2222 
   Start-Sleep 1
 }
 
+# There is no arm64 build; Windows on Arm runs this one emulated.
 $exe = "$box\cloudflared.exe"
 Invoke-WebRequest -UseBasicParsing -OutFile $exe "https://github.com/cloudflare/cloudflared/releases/download/$version/cloudflared-windows-amd64.exe"
 if ((Get-FileHash -Algorithm SHA256 $exe).Hash.ToLowerInvariant() -ne $sha256) { throw 'cloudflared checksum mismatch' }
