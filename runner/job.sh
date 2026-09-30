@@ -33,8 +33,11 @@ RUN
   kill)
     pid=$(cat "$2/pid")
     if windows; then
-      # Native children (cl.exe, ninja.exe) never see msys signals; kill the Windows tree.
-      taskkill //T //F //PID "$(cat "/proc/$pid/winpid")" > /dev/null 2>&1
+      # Native children (cl.exe, ninja.exe) never see msys signals, and msys forks leave no
+      # Windows parent links, so every Windows process of the msys group gets taskkill /T.
+      for w in $(ps | sed -E 's/^[ISO] / /' | awk -v g="$pid" '$3 == g { print $4 }'); do
+        taskkill //T //F //PID "$w" > /dev/null 2>&1
+      done
     else
       kill -TERM -- "-$pid" 2>/dev/null
     fi
