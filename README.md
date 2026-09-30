@@ -41,11 +41,14 @@ Use a separate Cloudflare account whose only zone serves nothing else: the tunne
 permission covers every tunnel in the account, local agents can read the token, and whoever
 runs code on the box can serve anything on its hostname until the tunnel is deleted.
 
-## Trust
+## The agent-box branch
 
-`box up` requires the `agent-box` branch to hold exactly `template/agent-box.yml`, pinned to
-a commit on this repo's main with the current runner code, and to be locked by the
-`agent-box` ruleset. Rulesets can only exempt roles, so every admin of the project repo can
-still move that branch; `box up` would refuse the result, but it assumes you are the only admin.
+`box install` creates it from `template/agent-box.yml` and locks it to repo admins; later runs
+only move the agent-box pin. Add the setup a box should start with before its last step,
+usually the checkout, toolchain and cache restore steps of the repo's CI: `~/src` is
+`$GITHUB_WORKSPACE`, so a restored compiler cache lands where CI keeps it and paths match.
+`box up` checks only that the branch is locked, keeps the dispatch inputs and pins current
+runner code. What those steps do cannot reach this machine: a box is untrusted anyway. Rulesets
+can only exempt roles, so every admin of the repo can change the branch.
 
 Local state (keys, ssh config, leases) is in `~/.local/state/agent-box`.

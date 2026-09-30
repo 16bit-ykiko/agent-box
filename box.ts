@@ -279,12 +279,15 @@ function renderWorkflow(owner: string, sha: string) {
     .replaceAll("@SHA@", sha);
 }
 
+const pinOf = (workflow: string) => new RegExp(`uses: ${ACTION}@([0-9a-f]{40})\\b`).exec(workflow)?.[1];
+
 function actionSha() {
   return gh(["api", `repos/${ACTION}/commits/main`, "--jq", ".sha"]).trim();
 }
 
-// The branch must hold exactly our workflow, pinned to a commit on agent-box's main whose
-// runner code is still current; anything else could hand our ssh session to other code.
+// The branch is the repo's to customise (setup steps before the box), but it must be locked to
+// admins, dispatchable by box up, and run agent-box pinned to a commit on its main whose runner
+// code is current. A box is untrusted either way: nothing secret is ever sent to it.
 function verifyBranch(repo: string, owner: string): string {
   let tip: string;
   try {
@@ -298,9 +301,10 @@ function verifyBranch(repo: string, owner: string): string {
     if (!rules.includes(r)) die(`${repo}:${BRANCH} is not locked (missing ${r} rule); run \`box install ${repo}\``);
   const file = ghJson<{ content: string }>(`repos/${repo}/contents/${WORKFLOW}?ref=${tip}`);
   const content = Buffer.from(file.content, "base64").toString("utf8");
-  const pinned = /uses: [\w.-]+\/[\w.-]+@([0-9a-f]{40})\n/.exec(content)?.[1];
-  if (!pinned || content !== renderWorkflow(owner, pinned))
-    die(`${repo}:${WORKFLOW} is not the agent-box workflow; run \`box install ${repo}\``);
+  const pinned = pinOf(content);
+  const needs = ["run-name: agent-box ${{ inputs.lease }}", "pubkey: ${{ inputs.pubkey }}", `github.triggering_actor == '${owner}'`];
+  if (!pinned || needs.some((n) => !content.includes(n)))
+    die(`${repo}:${WORKFLOW} lacks the agent-box step or its dispatch inputs; compare it with template/agent-box.yml`);
   const cmp = ghJson<{ status: string; files?: { filename: string }[] }>(`repos/${ACTION}/compare/${pinned}...main`);
   if (cmp.status !== "ahead" && cmp.status !== "identical") die(`${repo} pins ${pinned}, which is not on ${ACTION} main`);
   const files = cmp.files ?? [];
@@ -338,35 +342,6 @@ function parseBoxJson(dir: string) {
 
 // ---------------------------------------------------------------- commands
 
-// --cache PATH=PREFIX[,PREFIX...]: PATH exactly as the repo's CI passes it to actions/cache,
-// with {workspace} for github.workspace; the first prefix is also tried as the exact key.
-function parseCache(spec: string | undefined): string[] {
-  if (!spec) return [];
-  const eq = spec.lastIndexOf("=");
-  const where = spec.slice(0, eq);
-  const prefixes = spec.slice(eq + 1).split(",").filter(Boolean);
-  if (eq <= 0 || !prefixes.length) die("--cache takes PATH=PREFIX[,PREFIX...]");
-  if (/[{}]/.test(where.replaceAll("{workspace}", ""))) die("--cache PATH may only use {workspace}");
-  return [
-    "-f", `cache-path=${where.replaceAll("{workspace}", "{0}")}`,
-    "-f", `cache-key=${prefixes[0]}`,
-    "-f", `cache-restore-keys=${prefixes.join("\n")}`,
-  ];
-}
-
-// Caches a box can restore: the default branch's and the agent-box branch's.
-function caches(args: string[]) {
-  const [repo] = positional(args);
-  if (!repo || !/^[\w.-]+\/[\w.-]+$/.test(repo)) die("usage: box caches <owner/repo>");
-  const main = ghJson<{ default_branch: string }>(`repos/${repo}`).default_branch;
-  type Cache = { key: string; ref: string; size_in_bytes: number; last_accessed_at: string };
-  const { actions_caches } = ghJson<{ actions_caches: Cache[] }>(`repos/${repo}/actions/caches?per_page=100&sort=last_accessed_at`);
-  for (const c of actions_caches.filter((c) => c.ref === `refs/heads/${main}` || c.ref === `refs/heads/${BRANCH}`)) {
-    const mb = Math.round(c.size_in_bytes / 1e6);
-    console.log(`${String(mb).padStart(6)} MB  ${c.last_accessed_at.slice(0, 16)}  ${c.ref.replace("refs/heads/", "").padEnd(10)} ${c.key}`);
-  }
-}
-
 async function up(args: string[]) {
   const [repo] = positional(args);
   if (!repo || !/^[\w.-]+\/[\w.-]+$/.test(repo)) die("usage: box up <owner/repo> [--os OS] [--minutes N]");
@@ -374,7 +349,6 @@ async function up(args: string[]) {
   if (!OSES.includes(target)) die(`--os must be one of ${OSES.join(", ")}`);
   const minutes = flag(args, "--minutes") ?? "340";
   if (!/^\d+$/.test(minutes) || +minutes < 5 || +minutes > 340) die("--minutes must be 5..340");
-  const cache = parseCache(flag(args, "--cache"));
   const c = config();
   ensureState();
   await ensureCloudflared();
@@ -388,7 +362,7 @@ async function up(args: string[]) {
 
   try {
     const pubkey = fs.readFileSync(`${dir}/id_ed25519.pub`, "utf8").trim();
-    gh(["workflow", "run", "agent-box.yml", "-R", l.repo, "--ref", BRANCH, "-f", `lease=${l.id}`, "-f", `pubkey=${pubkey}`, "-f", `minutes=${minutes}`, "-f", `os=${target}`, ...cache], {
+    gh(["workflow", "run", "agent-box.yml", "-R", l.repo, "--ref", BRANCH, "-f", `lease=${l.id}`, "-f", `pubkey=${pubkey}`, "-f", `minutes=${minutes}`, "-f", `os=${target}`], {
       retry: false,
     });
     log(`${l.id}: dispatched on ${l.repo}, waiting for a runner`);
@@ -420,10 +394,6 @@ async function up(args: string[]) {
     await waitForSsh(l, 90);
     l.host = box.host;
     saveLease(l);
-    if (cache.length) {
-      const [matched, where] = (ssh(l, "cat ~/.box/cache", { timeout: 30_000 }).stdout ?? "").split("\n");
-      log(matched && matched !== "none" ? `${l.id}: restored cache ${matched} into ${where}` : `${l.id}: no cache matched`);
-    }
 
     const token = cloudflareToken(c);
     if (token) {
@@ -682,12 +652,13 @@ async function gc() {
   }
 }
 
-// Put the workflow on an orphan `agent-box` branch and lock the branch to repo admins.
+// Put the workflow on an orphan `agent-box` branch and lock the branch to repo admins. On an
+// existing branch only the agent-box pin moves; the repo's own steps stay.
 function install(args: string[]) {
   const repo = args[0];
   if (!repo || !/^[\w.-]+\/[\w.-]+$/.test(repo)) die("usage: box install <owner/repo>");
   const c = config();
-  const content = renderWorkflow(c.owner, actionSha());
+  const sha = actionSha();
   let tip: string | undefined;
   try {
     tip = gh(["api", `repos/${repo}/branches/${BRANCH}`, "--jq", ".commit.sha"]).trim();
@@ -697,8 +668,22 @@ function install(args: string[]) {
   }
   const post = (api: string, body: unknown) =>
     JSON.parse(execFileSync("gh", ["api", "-X", "POST", api, "--input", "-"], { input: JSON.stringify(body), encoding: "utf8" })) as { sha: string };
-  const tree = post(`repos/${repo}/git/trees`, { tree: [{ path: WORKFLOW, mode: "100644", type: "blob", content }] });
   const current = tip ? ghJson<{ tree: { sha: string } }>(`repos/${repo}/git/commits/${tip}`).tree.sha : undefined;
+  let content = renderWorkflow(c.owner, sha);
+  if (tip) {
+    let existing: string | undefined;
+    try {
+      existing = Buffer.from(ghJson<{ content: string }>(`repos/${repo}/contents/${WORKFLOW}?ref=${tip}`).content, "base64").toString("utf8");
+    } catch (e) {
+      if (!isNotFound(e)) throw e;
+    }
+    if (existing !== undefined) {
+      const old = pinOf(existing);
+      if (!old) die(`${repo}:${WORKFLOW} has no agent-box step to update; fix it by hand`);
+      content = existing.replace(`uses: ${ACTION}@${old}`, `uses: ${ACTION}@${sha}`);
+    }
+  }
+  const tree = post(`repos/${repo}/git/trees`, { base_tree: current, tree: [{ path: WORKFLOW, mode: "100644", type: "blob", content }] });
   if (current === tree.sha) log(`${repo}:${BRANCH} is up to date`);
   else {
     const commit = post(`repos/${repo}/git/commits`, { message: "agent-box: runner workflow", tree: tree.sha, parents: tip ? [tip] : [] });
@@ -734,7 +719,6 @@ function positional(args: string[]) {
 const USAGE = `usage:
   box install <owner/repo>        put the agent-box workflow on the repo's locked agent-box branch
   box up <owner/repo> [--os linux|linux-arm|macos|macos-intel|windows|windows-arm] [--minutes N]
-         [--cache PATH=PREFIX[,PREFIX...]]
                                   lease a runner; prints the lease id
   box push <id> [--ref REF] [--untracked] [--any-repo]
                                   send the working tree of tracked files (or REF's tree) to ~/src
@@ -742,7 +726,6 @@ const USAGE = `usage:
   box run <id> <command>          run a command in ~/src and return its exit code
   box ssh <id>                    interactive shell
   box down <id>                   release the runner and its tunnel
-  box caches <owner/repo>         caches a box of that repo can restore with --cache
   box ls                          list leases
   box gc                          release ended leases and orphaned tunnels`;
 
@@ -765,9 +748,6 @@ switch (cmd) {
     break;
   case "down":
     await down(rest);
-    break;
-  case "caches":
-    caches(rest);
     break;
   case "ls":
     ls();

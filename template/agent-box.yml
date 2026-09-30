@@ -1,4 +1,6 @@
-# Installed by `box install`; `box up` refuses to use this branch if the file differs.
+# Installed by `box install`, which later only moves the agent-box pin. Add whatever setup the
+# box should start with before the last step: the checkout, toolchain and cache restore steps of
+# this repo's CI, so a box builds where and how CI does.
 name: agent-box
 run-name: agent-box ${{ inputs.lease }}
 on:
@@ -16,12 +18,6 @@ on:
         type: choice
         default: linux
         options: [linux, linux-arm, macos, macos-intel, windows, windows-arm]
-      cache-path:
-        default: ""
-      cache-key:
-        default: ""
-      cache-restore-keys:
-        default: ""
 permissions: {}
 jobs:
   box:
@@ -33,6 +29,3 @@ jobs:
         with:
           pubkey: ${{ inputs.pubkey }}
           minutes: ${{ inputs.minutes }}
-          cache-path: ${{ inputs.cache-path }}
-          cache-key: ${{ inputs.cache-key }}
-          cache-restore-keys: ${{ inputs.cache-restore-keys }}
