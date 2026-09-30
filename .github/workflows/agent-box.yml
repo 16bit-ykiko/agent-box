@@ -29,7 +29,7 @@ jobs:
     runs-on: ${{ fromJSON('{"linux":"ubuntu-24.04","linux-arm":"ubuntu-24.04-arm","macos":"macos-15","macos-intel":"macos-15-intel","windows":"windows-2025","windows-arm":"windows-11-arm"}')[inputs.os] || 'ubuntu-24.04' }}
     timeout-minutes: 350
     steps:
-      - uses: 16bit-ykiko/agent-box@6f9ad5a8385c716a465d7cc2ab11dda8f477184a
+      - uses: 16bit-ykiko/agent-box@539d53665b31422d264602e6cd5f6d85ae12bf6d
         with:
           pubkey: ${{ inputs.pubkey }}
           minutes: ${{ inputs.minutes }}
