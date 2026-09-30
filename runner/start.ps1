@@ -18,6 +18,8 @@ $etc = 'C:\ProgramData\agent-box'
 New-Item -ItemType Directory -Force $box, $etc | Out-Null
 Copy-Item "$PSScriptRoot\job.sh" "$box\job"
 Copy-Item "$PSScriptRoot\spawn.ps1" "$box\spawn.ps1"
+# The same directory as CI, so absolute paths, and with them compiler cache hits, match.
+New-Item -ItemType Junction -Path "$HOME\src" -Target $env:GITHUB_WORKSPACE | Out-Null
 
 # The runner ends every process a step started when the step ends; processes created through
 # WMI are not the step's, so sshd and cloudflared outlive this step.

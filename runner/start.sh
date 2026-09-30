@@ -17,6 +17,8 @@ key_re='^ssh-ed25519 [A-Za-z0-9+/]+={0,2}( [A-Za-z0-9._@-]+)?$'
 box=~/.box
 mkdir -p "$box" && chmod 700 "$box"
 install -m 755 "$(dirname "$0")/job.sh" "$box/job"
+# The same directory as CI, so absolute paths, and with them compiler cache hits, match.
+ln -sfn "$GITHUB_WORKSPACE" ~/src
 
 [[ -x /usr/sbin/sshd ]] || { sudo apt-get update -qq && sudo apt-get install -y -qq openssh-server >/dev/null; }
 sudo install -d -m 755 /etc/agent-box

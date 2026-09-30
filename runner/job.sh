@@ -14,7 +14,7 @@ case $1 in
     cat > "$d/run.sh" <<'RUN'
 d=$(dirname "$0")
 echo $$ > "$d/pid"
-cd ~/src 2>/dev/null || cd ~
+cd -P ~/src 2>/dev/null || cd ~
 bash "$d/cmd" > "$d/log" 2>&1 < /dev/null
 echo $? > "$d/exit"
 RUN

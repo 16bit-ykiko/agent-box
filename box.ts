@@ -338,6 +338,35 @@ function parseBoxJson(dir: string) {
 
 // ---------------------------------------------------------------- commands
 
+// --cache PATH=PREFIX[,PREFIX...]: PATH exactly as the repo's CI passes it to actions/cache,
+// with {workspace} for github.workspace; the first prefix is also tried as the exact key.
+function parseCache(spec: string | undefined): string[] {
+  if (!spec) return [];
+  const eq = spec.lastIndexOf("=");
+  const where = spec.slice(0, eq);
+  const prefixes = spec.slice(eq + 1).split(",").filter(Boolean);
+  if (eq <= 0 || !prefixes.length) die("--cache takes PATH=PREFIX[,PREFIX...]");
+  if (/[{}]/.test(where.replaceAll("{workspace}", ""))) die("--cache PATH may only use {workspace}");
+  return [
+    "-f", `cache-path=${where.replaceAll("{workspace}", "{0}")}`,
+    "-f", `cache-key=${prefixes[0]}`,
+    "-f", `cache-restore-keys=${prefixes.join("\n")}`,
+  ];
+}
+
+// Caches a box can restore: the default branch's and the agent-box branch's.
+function caches(args: string[]) {
+  const [repo] = positional(args);
+  if (!repo || !/^[\w.-]+\/[\w.-]+$/.test(repo)) die("usage: box caches <owner/repo>");
+  const main = ghJson<{ default_branch: string }>(`repos/${repo}`).default_branch;
+  type Cache = { key: string; ref: string; size_in_bytes: number; last_accessed_at: string };
+  const { actions_caches } = ghJson<{ actions_caches: Cache[] }>(`repos/${repo}/actions/caches?per_page=100&sort=last_accessed_at`);
+  for (const c of actions_caches.filter((c) => c.ref === `refs/heads/${main}` || c.ref === `refs/heads/${BRANCH}`)) {
+    const mb = Math.round(c.size_in_bytes / 1e6);
+    console.log(`${String(mb).padStart(6)} MB  ${c.last_accessed_at.slice(0, 16)}  ${c.ref.replace("refs/heads/", "").padEnd(10)} ${c.key}`);
+  }
+}
+
 async function up(args: string[]) {
   const [repo] = positional(args);
   if (!repo || !/^[\w.-]+\/[\w.-]+$/.test(repo)) die("usage: box up <owner/repo> [--os OS] [--minutes N]");
@@ -345,6 +374,7 @@ async function up(args: string[]) {
   if (!OSES.includes(target)) die(`--os must be one of ${OSES.join(", ")}`);
   const minutes = flag(args, "--minutes") ?? "340";
   if (!/^\d+$/.test(minutes) || +minutes < 5 || +minutes > 340) die("--minutes must be 5..340");
+  const cache = parseCache(flag(args, "--cache"));
   const c = config();
   ensureState();
   await ensureCloudflared();
@@ -358,7 +388,7 @@ async function up(args: string[]) {
 
   try {
     const pubkey = fs.readFileSync(`${dir}/id_ed25519.pub`, "utf8").trim();
-    gh(["workflow", "run", "agent-box.yml", "-R", l.repo, "--ref", BRANCH, "-f", `lease=${l.id}`, "-f", `pubkey=${pubkey}`, "-f", `minutes=${minutes}`, "-f", `os=${target}`], {
+    gh(["workflow", "run", "agent-box.yml", "-R", l.repo, "--ref", BRANCH, "-f", `lease=${l.id}`, "-f", `pubkey=${pubkey}`, "-f", `minutes=${minutes}`, "-f", `os=${target}`, ...cache], {
       retry: false,
     });
     log(`${l.id}: dispatched on ${l.repo}, waiting for a runner`);
@@ -390,6 +420,10 @@ async function up(args: string[]) {
     await waitForSsh(l, 90);
     l.host = box.host;
     saveLease(l);
+    if (cache.length) {
+      const [matched, where] = (ssh(l, "cat ~/.box/cache", { timeout: 30_000 }).stdout ?? "").split("\n");
+      log(matched && matched !== "none" ? `${l.id}: restored cache ${matched} into ${where}` : `${l.id}: no cache matched`);
+    }
 
     const token = cloudflareToken(c);
     if (token) {
@@ -568,7 +602,7 @@ async function run(args: string[]) {
 
 function shell(args: string[]) {
   const l = loadLease(args[0]);
-  const r = spawnSync("ssh", ["-F", sshConfig(l.id), "-t", "box", "cd ~/src 2>/dev/null; exec bash -l"], { stdio: "inherit" });
+  const r = spawnSync("ssh", ["-F", sshConfig(l.id), "-t", "box", "cd -P ~/src 2>/dev/null; exec bash -l"], { stdio: "inherit" });
   process.exit(r.status ?? 255);
 }
 
@@ -700,6 +734,7 @@ function positional(args: string[]) {
 const USAGE = `usage:
   box install <owner/repo>        put the agent-box workflow on the repo's locked agent-box branch
   box up <owner/repo> [--os linux|linux-arm|macos|macos-intel|windows|windows-arm] [--minutes N]
+         [--cache PATH=PREFIX[,PREFIX...]]
                                   lease a runner; prints the lease id
   box push <id> [--ref REF] [--untracked] [--any-repo]
                                   send the working tree of tracked files (or REF's tree) to ~/src
@@ -707,6 +742,7 @@ const USAGE = `usage:
   box run <id> <command>          run a command in ~/src and return its exit code
   box ssh <id>                    interactive shell
   box down <id>                   release the runner and its tunnel
+  box caches <owner/repo>         caches a box of that repo can restore with --cache
   box ls                          list leases
   box gc                          release ended leases and orphaned tunnels`;
 
@@ -729,6 +765,9 @@ switch (cmd) {
     break;
   case "down":
     await down(rest);
+    break;
+  case "caches":
+    caches(rest);
     break;
   case "ls":
     ls();

@@ -10,6 +10,17 @@ inputs:
   idle-minutes:
     description: Stop after this many minutes without an ssh connection or a running job
     default: "60"
+  cache-path:
+    description: >-
+      Restore this actions/cache path before the box comes up, written exactly as the repo's CI
+      writes it ({0} stands for the workspace); empty for none
+    default: ""
+  cache-key:
+    description: Primary key for the restore
+    default: ""
+  cache-restore-keys:
+    description: Key prefixes to fall back to, one per line
+    default: ""
 runs:
   using: composite
   steps:
@@ -25,6 +36,20 @@ runs:
       env:
         PUBKEY: ${{ inputs.pubkey }}
       run: '& "$env:GITHUB_ACTION_PATH/runner/start.ps1"'
+    # Read-only: a box never saves, the repo's cache quota belongs to its CI.
+    - id: cache
+      if: inputs.cache-path != ''
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ format(inputs.cache-path, github.workspace) }}
+        key: ${{ inputs.cache-key }}
+        restore-keys: ${{ inputs.cache-restore-keys }}
+    - if: inputs.cache-path != ''
+      shell: bash
+      env:
+        MATCHED: ${{ steps.cache.outputs.cache-matched-key }}
+        CACHE_PATH: ${{ format(inputs.cache-path, github.workspace) }}
+      run: printf '%s\n%s\n' "${MATCHED:-none}" "$CACHE_PATH" > ~/.box/cache
     - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
       with:
         name: box

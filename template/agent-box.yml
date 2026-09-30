@@ -16,6 +16,12 @@ on:
         type: choice
         default: linux
         options: [linux, linux-arm, macos, macos-intel, windows, windows-arm]
+      cache-path:
+        default: ""
+      cache-key:
+        default: ""
+      cache-restore-keys:
+        default: ""
 permissions: {}
 jobs:
   box:
@@ -27,3 +33,6 @@ jobs:
         with:
           pubkey: ${{ inputs.pubkey }}
           minutes: ${{ inputs.minutes }}
+          cache-path: ${{ inputs.cache-path }}
+          cache-key: ${{ inputs.cache-key }}
+          cache-restore-keys: ${{ inputs.cache-restore-keys }}
