@@ -88,6 +88,11 @@ function loadLease(id: string | undefined): Lease {
   if (!fs.existsSync(file)) die(`no lease ${id}`);
   return JSON.parse(fs.readFileSync(file, "utf8")) as Lease;
 }
+function readyLease(id: string | undefined): Lease {
+  const l = loadLease(id);
+  if (!l.host) die(`lease ${l.id} is still starting; \`box up\` prints its id once it is ready`);
+  return l;
+}
 function allLeases(): Lease[] {
   const dir = path.join(STATE, "leases");
   if (!fs.existsSync(dir)) return [];
@@ -481,7 +486,7 @@ function remoteMatches(repo: string) {
 }
 
 function push(args: string[]) {
-  const l = loadLease(args[0]);
+  const l = readyLease(args[0]);
   const ref = flag(args, "--ref") ?? "HEAD";
   if (!args.includes("--any-repo") && !remoteMatches(l.repo))
     die(`this checkout has no remote for ${l.repo}; pass --any-repo if that is intended`);
@@ -509,7 +514,7 @@ const clean = (s: string) => s.replace(CONTROL, "").replace(/\r(?!\n)/g, "\n");
 // The command runs detached on the box, so a dropped tunnel only interrupts the output: the
 // follower reconnects and resumes from the last byte it saw.
 async function run(args: string[]) {
-  const l = loadLease(args[0]);
+  const l = readyLease(args[0]);
   const command = args.slice(1).join(" ");
   if (!command) die("usage: box run <id> <command>");
   const job = `~/.box/jobs/${randomBytes(4).toString("hex")}`;
@@ -571,7 +576,7 @@ async function run(args: string[]) {
 }
 
 function shell(args: string[]) {
-  const l = loadLease(args[0]);
+  const l = readyLease(args[0]);
   const r = spawnSync("ssh", ["-F", sshConfig(l.id), "-t", "box", "cd -P ~/src 2>/dev/null; exec bash --rcfile ~/.box/bashrc -i"], { stdio: "inherit" });
   process.exit(r.status ?? 255);
 }
