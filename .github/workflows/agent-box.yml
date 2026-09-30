@@ -15,15 +15,15 @@ on:
       os:
         type: choice
         default: linux
-        options: [linux, linux-arm, macos, macos-intel, windows]
+        options: [linux, linux-arm, macos, macos-intel, windows, windows-arm]
 permissions: {}
 jobs:
   box:
     if: github.event_name == 'workflow_dispatch' && github.actor == '16bit-ykiko' && github.triggering_actor == '16bit-ykiko'
-    runs-on: ${{ fromJSON('{"linux":"ubuntu-24.04","linux-arm":"ubuntu-24.04-arm","macos":"macos-15","macos-intel":"macos-15-intel","windows":"windows-2025"}')[inputs.os] || 'ubuntu-24.04' }}
+    runs-on: ${{ fromJSON('{"linux":"ubuntu-24.04","linux-arm":"ubuntu-24.04-arm","macos":"macos-15","macos-intel":"macos-15-intel","windows":"windows-2025","windows-arm":"windows-11-arm"}')[inputs.os] || 'ubuntu-24.04' }}
     timeout-minutes: 350
     steps:
-      - uses: 16bit-ykiko/agent-box@a4d3afe9b0db30c413db27ce22b1ad346e98b6dc
+      - uses: 16bit-ykiko/agent-box@3b725feccbdccf924c8cfa64cd450b8e1c0a60db
         with:
           pubkey: ${{ inputs.pubkey }}
           minutes: ${{ inputs.minutes }}
