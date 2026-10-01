@@ -64,7 +64,7 @@ function gh(args: string[], { retry = true } = {}): string {
       return execFileSync("gh", args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
     } catch (e) {
       const stderr = String((e as { stderr?: unknown }).stderr ?? "");
-      if (!retry || attempt >= 4 || /HTTP 4\d\d/.test(stderr)) throw e;
+      if (!retry || attempt >= 6 || /HTTP 4\d\d/.test(stderr)) throw e;
       Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 2000 * attempt);
     }
   }
@@ -768,6 +768,7 @@ const USAGE = `usage:
   box gc                          release ended leases and orphaned tunnels`;
 
 const [cmd, ...rest] = process.argv.slice(2);
+process.on("uncaughtException", (e: Error & { stderr?: unknown }) => die(String(e.stderr || e.message).trim()));
 switch (cmd) {
   case "install":
     install(rest);
