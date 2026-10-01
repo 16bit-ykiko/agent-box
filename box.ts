@@ -369,6 +369,9 @@ async function up(args: string[]) {
     const model = cpuOf(l);
     if (!cpu || cpu.test(model) || attempt >= tries) {
       if (cpu && !cpu.test(model)) log(`${l.id}: no ${cpuFlag} in ${tries} tries, keeping ${model}`);
+      // Setup steps on the repo's agent-box branch can leave instructions in ~/.box/notes.
+      const notes = clean(ssh(l, "cat ~/.box/notes 2>/dev/null", { timeout: 30_000 }).stdout ?? "").trim();
+      for (const line of notes ? notes.split("\n") : []) log(`${l.id}: note: ${line}`);
       log(`${l.id}: ready on ${l.host} (${l.repo} on ${target}, ${model}, up to ${minutes} min, stops after 60 min idle)`);
       console.log(l.id);
       return;

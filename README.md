@@ -47,6 +47,7 @@ runs code on the box can serve anything on its hostname until the tunnel is dele
 only move the agent-box pin. Add the setup a box should start with before its last step,
 usually the checkout, toolchain and cache restore steps of the repo's CI: `~/src` is
 `$GITHUB_WORKSPACE`, so a restored compiler cache lands where CI keeps it and paths match.
+Setup steps can leave instructions for the agent in `~/.box/notes`; `box up` prints them.
 `box up` checks only that the branch is locked, keeps the dispatch inputs and pins current
 runner code. What those steps do cannot reach this machine: a box is untrusted anyway. Rulesets
 can only exempt roles, so every admin of the repo can change the branch.
