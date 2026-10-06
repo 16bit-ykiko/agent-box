@@ -607,6 +607,37 @@ async function run(args: string[]) {
   process.exit(/^\d+/.test(exit.stdout ?? "") ? parseInt(exit.stdout, 10) : 255);
 }
 
+// Files go from one box to another, or between a box and this checkout (`.`), as one tar
+// stream through this machine, gzip'd at its fastest: debug info shrinks to about a quarter,
+// and the two tunnels are the bottleneck. Symlinks are followed: a build tree is mostly links
+// into the build system's output base. Each path keeps its place under ~/src (the current
+// directory here).
+async function cp(args: string[]) {
+  const [from, to, ...paths] = positional(args);
+  if (!from || !to || paths.length === 0) die("usage: box cp <from> <to> <path>... [--exclude PATTERN]...");
+  const quote = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
+  const excludes = args.flatMap((a, i) => (a === "--exclude" && args[i + 1] ? [`--exclude=${quote(args[i + 1])}`] : []));
+  const side = (id: string, command: string) =>
+    id === "."
+      ? spawn("bash", ["-c", command], { stdio: ["pipe", "pipe", "pipe"] })
+      : spawn("ssh", ["-F", sshConfig(readyLease(id).id), "box", `cd ~/src && ${command}`], { stdio: ["pipe", "pipe", "pipe"] });
+  const started = Date.now();
+  const reader = side(from, `set -o pipefail; tar -chf - ${[...excludes, ...paths.map(quote)].join(" ")} | gzip -1`);
+  const writer = side(to, "set -o pipefail; gzip -dc | tar -xf -");
+  let bytes = 0;
+  reader.stdout.on("data", (chunk: Buffer) => (bytes += chunk.length));
+  reader.stdout.pipe(writer.stdin);
+  const finished = (child: ReturnType<typeof spawn>) => {
+    let stderr = "";
+    child.stderr?.on("data", (chunk: Buffer) => (stderr += chunk));
+    return new Promise<[number | null, string]>((resolve) => child.on("close", (code) => resolve([code, stderr])));
+  };
+  const [[readStatus, readError], [writeStatus, writeError]] = await Promise.all([finished(reader), finished(writer)]);
+  if (readStatus !== 0) die(`reading on ${from} failed: ${clean(readError).trim()}`);
+  if (writeStatus !== 0) die(`writing on ${to} failed: ${clean(writeError).trim()}`);
+  log(`${from} -> ${to}: ${(bytes / 1048576).toFixed(1)} MB in ${((Date.now() - started) / 1000).toFixed(0)} s`);
+}
+
 function shell(args: string[]) {
   const l = readyLease(args[0]);
   const r = spawnSync("ssh", ["-F", sshConfig(l.id), "-t", "box", "cd -P ~/src 2>/dev/null; exec bash --rcfile ~/.box/bashrc -i"], { stdio: "inherit" });
@@ -762,6 +793,9 @@ const USAGE = `usage:
                                   send the working tree of tracked files (or REF's tree) to ~/src
                                   as one commit without history
   box run <id> <command>          run a command in ~/src and return its exit code
+  box cp <from> <to> <path>... [--exclude PATTERN]...
+                                  copy paths under ~/src from one box to another (a lease id, or
+                                  . for this checkout), following symlinks
   box ssh <id>                    interactive shell
   box down <id>                   release the runner and its tunnel
   box ls                          list leases
@@ -781,6 +815,9 @@ switch (cmd) {
     break;
   case "run":
     await run(rest);
+    break;
+  case "cp":
+    await cp(rest);
     break;
   case "ssh":
     shell(rest);
