@@ -27,8 +27,9 @@ after 60 minutes without an ssh connection or at `--minutes` (default and max 34
   staged but not committed count as tracked and are sent; the files that differ from HEAD
   are listed. It refuses to push from a checkout without a GitHub remote for the leased repo.
 - **`box cp`** copies paths below `~/src` (or this checkout, `.`) as a tar, following
-  symlinks on a box but not here. The receiver unpacks only the paths asked for, whatever the
-  sender put in the stream, and this checkout takes only plain files and directories, so a box
+  symlinks on a box but not here, where no link on the way may lead out of the checkout. The
+  receiver unpacks only the paths asked for, whatever the sender put in the stream, and this
+  checkout takes only plain files and directories and never a `.git` or `.claude`, so a box
   can plant neither hooks nor links here. From one box to another the stream never touches
   this machine: the destination pulls it, zstd'd, over the source's tunnel, with a key it
   makes for this copy that the source accepts for one session, within ten minutes, for that
@@ -38,7 +39,8 @@ after 60 minutes without an ssh connection or at `--minutes` (default and max 34
   after a dropped tunnel; Ctrl-C or SIGTERM kills it on the box. stdout and stderr arrive
   merged. The output is untrusted: when it is not a terminal, escape sequences and control
   characters are stripped; on a terminal colours stay, but OSC (clipboard, title, links), DCS,
-  APC, PM and SOS strings go. Everything else box prints from a box is stripped too. Anything on the runner can `sudo`; never send credentials to it.
+  APC, PM and SOS strings go. Everything else box prints from a box is stripped too, except
+  in `box ssh`, which is a plain interactive terminal. Anything on the runner can `sudo`; never send credentials to it.
 
 ## Named tunnels (optional)
 
