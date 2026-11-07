@@ -543,6 +543,7 @@ function push(args: string[]) {
 const CONTROL =
   /\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-_]|[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\u0080-\u009f]|\p{Cf}/gu;
 const clean = (s: string) => s.replace(CONTROL, "").replace(/\r(?!\n)/g, "\n");
+const quote = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
 
 // The command runs detached on the box, so a dropped tunnel only interrupts the output: the
 // follower reconnects and resumes from the last byte it saw.
@@ -608,22 +609,24 @@ async function run(args: string[]) {
   process.exit(/^\d+/.test(exit.stdout ?? "") ? parseInt(exit.stdout, 10) : 255);
 }
 
-// Files go from one box to another, or between a box and this checkout (`.`), as one tar
-// stream through this machine, gzip'd at its fastest: debug info shrinks to about a quarter,
-// and the two tunnels are the bottleneck. Symlinks are followed: a build tree is mostly links
-// into the build system's output base. Each path keeps its place under ~/src (the current
-// directory here).
+// Files go as one tar stream of the paths, which keep their place under ~/src (the current
+// directory here). Symlinks are followed: a build tree is mostly links into the build system's
+// output base. Between two boxes the stream goes from runner to runner (copyDirect); with `.`,
+// this checkout, or --via-here it comes through this machine, gzip'd at its fastest: debug
+// info shrinks to about a quarter, and the proxied tunnels are the bottleneck.
 async function cp(args: string[]) {
-  const [from, to, ...paths] = positional(args);
-  if (!from || !to || paths.length === 0) die("usage: box cp <from> <to> <path>... [--exclude PATTERN]...");
-  const quote = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
+  const [from, to, ...paths] = positional(args, ["--via-here"]);
+  if (!from || !to || paths.length === 0) die("usage: box cp <from> <to> <path>... [--exclude PATTERN]... [--via-here]");
+  if (from === to) die("box cp copies between two different boxes");
   const excludes = args.flatMap((a, i) => (a === "--exclude" && args[i + 1] ? [`--exclude=${quote(args[i + 1])}`] : []));
+  const tar = `tar -chf - ${[...excludes, ...paths.map(quote)].join(" ")}`;
+  if (from !== "." && to !== "." && !args.includes("--via-here")) return copyDirect(readyLease(from), readyLease(to), tar);
   const side = (id: string, command: string) =>
     id === "."
       ? spawn("bash", ["-c", command], { stdio: ["pipe", "pipe", "pipe"] })
       : spawn("ssh", ["-F", sshConfig(readyLease(id).id), "box", `cd ~/src && ${command}`], { stdio: ["pipe", "pipe", "pipe"] });
   const started = Date.now();
-  const reader = side(from, `set -o pipefail; tar -chf - ${[...excludes, ...paths.map(quote)].join(" ")} | gzip -1`);
+  const reader = side(from, `set -o pipefail; ${tar} | gzip -1`);
   const writer = side(to, "set -o pipefail; gzip -dc | tar -xf -");
   let bytes = 0;
   reader.stdout.on("data", (chunk: Buffer) => (bytes += chunk.length));
@@ -637,6 +640,83 @@ async function cp(args: string[]) {
   if (readStatus !== 0) die(`reading on ${from} failed: ${clean(readError).trim()}`);
   if (writeStatus !== 0) die(`writing on ${to} failed: ${clean(writeError).trim()}`);
   log(`${from} -> ${to}: ${(bytes / 1048576).toFixed(1)} MB in ${((Date.now() - started) / 1000).toFixed(0)} s`);
+}
+
+// The destination pulls the stream over the source's own tunnel, so it never crosses this
+// machine, whose tunnels go through a metered proxy. It logs in with a key it makes for this
+// copy, which the source accepts once, within ten minutes, for this one tar only, and it
+// checks the source against the host key pinned here. zstd keeps up with a runner-to-runner
+// link, which gzip cannot. A failure is reported, never retried through this machine.
+async function copyDirect(src: Lease, dst: Lease, tar: string) {
+  const tag = `box-cp-${randomBytes(4).toString("hex")}`;
+  const dir = `~/.box/cp/${tag}`;
+  const user = /^\s*User (\S+)$/m.exec(fs.readFileSync(sshConfig(src.id), "utf8"))?.[1];
+  if (!user) die(`no ssh user for ${src.id}`);
+  const hostKey = fs.readFileSync(path.join(leaseDir(src.id), "known_hosts"), "utf8");
+  // authorized_keys is root's on Linux and macOS; on Windows the user, an admin, can write it.
+  const keys = "if [ -f /etc/agent-box/authorized_keys ]; then f=/etc/agent-box/authorized_keys s=sudo; else f=/c/ProgramData/agent-box/authorized_keys s=; fi";
+  const unauthorize = `${keys}; k=$(mktemp); if grep -q ' ${tag}$' "$f" && grep -v ' ${tag}$' "$f" > $k && [ -s $k ]; then $s tee "$f" < $k > /dev/null; fi; rm -f $k`;
+  const cleanup = () => {
+    ssh(src, `${unauthorize}; rm -rf ${dir}`, { timeout: 30_000 });
+    ssh(dst, `rm -rf ${dir}`, { timeout: 30_000 });
+  };
+  process.on("SIGINT", () => (cleanup(), process.exit(130)));
+  process.on("SIGTERM", () => (cleanup(), process.exit(143)));
+
+  const attempt = async () => {
+    const made = ssh(dst, `set -e; mkdir -p ${dir}; cd ${dir}; cat > known_hosts; /usr/bin/ssh-keygen -q -t ed25519 -N '' -C ${tag} -f key; cat key.pub`, {
+      input: hostKey,
+      timeout: 60_000,
+    });
+    const pubkey = clean(made.stdout ?? "").trim();
+    if (made.status !== 0 || !new RegExp(`^ssh-ed25519 [A-Za-z0-9+/]+={0,2} ${tag}$`).test(pubkey))
+      throw new Error(`cannot make a key on ${dst.id}: ${clean(made.stderr ?? "").trim()}`);
+
+    // The source's forced command first takes its own key out again: one login only.
+    const send = [unauthorize, "[ -f ~/.box/env ] && . ~/.box/env", `cd ~/src && set -o pipefail && ${tar} | zstd -1 -T0 -q`].join("\n");
+    const expiry = new Date(Date.now() + 10 * 60_000).toISOString().replace(/[-:T]/g, "").slice(0, 12);
+    const line = `restrict,command="bash ${dir}/send",expiry-time="${expiry}Z" ${pubkey}`;
+    const auth = ssh(src, `set -e; mkdir -p ${dir}; IFS= read -r line; cat > ${dir}/send; ${keys}; printf '%s\\n' "$line" | $s tee -a "$f" > /dev/null`, {
+      input: `${line}\n${send}\n`,
+      timeout: 60_000,
+    });
+    if (auth.status !== 0) throw new Error(`cannot let ${dst.id} in on ${src.id}: ${clean(auth.stderr ?? "").trim()}`);
+
+    const pull = [
+      `d=${dir}`,
+      "[ -f ~/.box/env ] && . ~/.box/env",
+      "c=~/.box/cloudflared; [ -e $c ] || c=$c.exe",
+      // This machine went away (Ctrl-C, a timeout): the copy stops with it. A background job
+      // would read /dev/null, hence fd 3.
+      "exec 3<&0; { cat <&3; kill 0; } > /dev/null 2>&1 & exec 3<&-",
+      "set -o pipefail",
+      [
+        "cd ~/src && /usr/bin/ssh -n -T -F /dev/null -i $d/key -o IdentitiesOnly=yes -o IdentityAgent=none -o BatchMode=yes",
+        `-o StrictHostKeyChecking=yes -o UserKnownHostsFile=$d/known_hosts -o GlobalKnownHostsFile=/dev/null -o HostKeyAlias=agent-box-${src.id}`,
+        "-o UpdateHostKeys=no -o ConnectTimeout=60 -o ServerAliveInterval=15 -o ServerAliveCountMax=4",
+        `-o "ProxyCommand=$c access ssh --hostname %h" -l ${quote(user)} ${quote(src.host!)}`,
+        "| dd bs=1048576 2> $d/dd | zstd -dcq | tar -xf -",
+      ].join(" "),
+      // A killed shell can still exit 0 on Windows, so success is said, not inferred.
+      "s=$?; kill $! 2>/dev/null; [ $s = 0 ] && echo \"copied $(grep -o '^[0-9]* bytes' $d/dd)\"; exit $s",
+    ].join("\n");
+    const started = Date.now();
+    const child = spawn("ssh", ["-F", sshConfig(dst.id), "box", pull], { stdio: ["pipe", "pipe", "pipe"] });
+    let out = "";
+    let err = "";
+    child.stdout.on("data", (chunk: Buffer) => (out += chunk));
+    child.stderr.on("data", (chunk: Buffer) => (err += chunk));
+    const status = await new Promise<number | null>((resolve) => child.on("close", resolve));
+    const copied = /^copied (\d+) bytes$/m.exec(out);
+    if (status !== 0 || !copied) throw new Error(`${src.id} -> ${dst.id} failed: ${clean(err).trim() || `exit ${status}`}`);
+    return { bytes: +copied[1], seconds: (Date.now() - started) / 1000 };
+  };
+
+  const result = await attempt().catch((e: Error) => e);
+  cleanup();
+  if (result instanceof Error)
+    die(`${result.message}\nbox: nothing went through this machine; --via-here would send it through the metered proxy, so ask the user first`);
+  log(`${src.id} -> ${dst.id}: ${(result.bytes / 1048576).toFixed(1)} MB in ${result.seconds.toFixed(0)} s, runner to runner`);
 }
 
 function shell(args: string[]) {
@@ -815,8 +895,9 @@ function flag(args: string[], name: string) {
   const i = args.indexOf(name);
   return i >= 0 ? args[i + 1] : undefined;
 }
-function positional(args: string[]) {
-  return args.filter((a, i) => !a.startsWith("--") && !args[i - 1]?.startsWith("--"));
+// Flags take a value unless they are one of `switches`.
+function positional(args: string[], switches: string[] = []) {
+  return args.filter((a, i) => !a.startsWith("--") && !(args[i - 1]?.startsWith("--") && !switches.includes(args[i - 1])));
 }
 
 const USAGE = `usage:
@@ -828,9 +909,11 @@ const USAGE = `usage:
                                   send the working tree of tracked files (or REF's tree) to ~/src
                                   as one commit without history
   box run <id> <command>          run a command in ~/src and return its exit code
-  box cp <from> <to> <path>... [--exclude PATTERN]...
+  box cp <from> <to> <path>... [--exclude PATTERN]... [--via-here]
                                   copy paths under ~/src from one box to another (a lease id, or
-                                  . for this checkout), following symlinks
+                                  . for this checkout), following symlinks; box to box goes from
+                                  runner to runner, or with --via-here through this machine and
+                                  its metered proxy
   box ssh <id>                    interactive shell
   box down <id>                   release the runner and its tunnel
   box ls                          list running leases; forget ended ones

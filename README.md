@@ -8,7 +8,7 @@ box install owner/repo          # once per repo: locked `agent-box` branch with 
 id=$(box up owner/repo)         # ~1 min; prints the lease id
 box push $id                    # working tree of tracked files -> ~/src
 box run $id 'cmake -B build -G Ninja && ninja -C build'
-box cp $id $other build/bin     # build/bin under ~/src, from one box to another
+box cp $id $other build/bin     # build/bin under ~/src, from one runner straight to the other
 box ssh $id
 box down $id
 ```
@@ -26,8 +26,12 @@ after 60 minutes without an ssh connection or at `--minutes` (default and max 34
   (or `--ref`'s tree): no history, no untracked files unless `--untracked`. Files that are
   staged but not committed count as tracked and are sent; the files that differ from HEAD
   are listed. It refuses to push from a checkout without a GitHub remote for the leased repo.
-- **`box cp`** streams paths under `~/src` from one box to another (or `.`, this checkout)
-  as a tar through this machine, following symlinks.
+- **`box cp`** copies paths under `~/src` as a tar, following symlinks. From one box to
+  another the stream never touches this machine: the destination pulls it, zstd'd, over the
+  source's tunnel, with a key it makes for this copy that the source accepts once, within ten
+  minutes, for that tar only, and checks the source's host key pinned here. Nothing of this
+  machine's goes to either box. With `.` (this checkout), or `--via-here`, the tar comes
+  through this machine, gzip'd.
 - **`box run`** starts the command detached on the box and follows its output, reconnecting
   after a dropped tunnel; Ctrl-C or SIGTERM kills it on the box. stdout and stderr arrive
   merged. The output is untrusted: when it is not a terminal, escape sequences and control
