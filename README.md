@@ -26,16 +26,19 @@ after 60 minutes without an ssh connection or at `--minutes` (default and max 34
   (or `--ref`'s tree): no history, no untracked files unless `--untracked`. Files that are
   staged but not committed count as tracked and are sent; the files that differ from HEAD
   are listed. It refuses to push from a checkout without a GitHub remote for the leased repo.
-- **`box cp`** copies paths under `~/src` as a tar, following symlinks. From one box to
-  another the stream never touches this machine: the destination pulls it, zstd'd, over the
-  source's tunnel, with a key it makes for this copy that the source accepts once, within ten
-  minutes, for that tar only, and checks the source's host key pinned here. Nothing of this
-  machine's goes to either box. With `.` (this checkout), or `--via-here`, the tar comes
-  through this machine, gzip'd.
+- **`box cp`** copies paths below `~/src` (or this checkout, `.`) as a tar, following
+  symlinks on a box but not here. The receiver unpacks only the paths asked for, whatever the
+  sender put in the stream, and this checkout takes only plain files and directories, so a box
+  can plant neither hooks nor links here. From one box to another the stream never touches
+  this machine: the destination pulls it, zstd'd, over the source's tunnel, with a key it
+  makes for this copy that the source accepts for one session, within ten minutes, for that
+  tar only, and checks the source's host key pinned here. Nothing of this machine's goes to
+  either box. With `.`, or `--via-here`, the tar comes through this machine, gzip'd.
 - **`box run`** starts the command detached on the box and follows its output, reconnecting
   after a dropped tunnel; Ctrl-C or SIGTERM kills it on the box. stdout and stderr arrive
   merged. The output is untrusted: when it is not a terminal, escape sequences and control
-  characters are stripped. Anything on the runner can `sudo`; never send credentials to it.
+  characters are stripped; on a terminal colours stay, but OSC (clipboard, title, links), DCS,
+  APC, PM and SOS strings go. Everything else box prints from a box is stripped too. Anything on the runner can `sudo`; never send credentials to it.
 
 ## Named tunnels (optional)
 
@@ -54,9 +57,10 @@ runs code on the box can serve anything on its hostname until the tunnel is dele
 only move the agent-box pin. Add the setup a box should start with before its last step,
 usually the checkout, toolchain and cache restore steps of the repo's CI: `~/src` is
 `$GITHUB_WORKSPACE`, so a restored compiler cache lands where CI keeps it and paths match.
-Setup steps can leave instructions for the agent in `~/.box/notes`; `box up` prints them.
-`box up` checks only that the branch is locked, keeps the dispatch inputs and pins current
-runner code. What those steps do cannot reach this machine: a box is untrusted anyway. Rulesets
+Instructions for the agent go in `.github/agent-box/<os>.md`, `<linux|macos|windows>.md` or
+`default.md` on the branch; `box up` prints the first that exists, read from GitHub, never from
+the box. `box up` checks only that the branch is locked by a ruleset only admins can bypass,
+keeps the dispatch inputs, grants no write permission and pins current runner code. What those steps do cannot reach this machine: a box is untrusted anyway. Rulesets
 can only exempt roles, so every admin of the repo can change the branch.
 
 Local state (keys, ssh config, leases) is in `~/.local/state/agent-box`.

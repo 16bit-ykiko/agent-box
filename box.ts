@@ -31,7 +31,19 @@ type Lease = {
   named?: { tunnelId: string; dnsId: string; accountId: string; zoneId: string };
 };
 
-const log = (msg: string) => process.stderr.write(`box: ${msg}\n`);
+// What comes back from the box is untrusted. All that box itself prints goes through clean(),
+// which strips escape sequences, control and invisible format characters. `box run` on a
+// terminal keeps colours and cursor movement, but not the strings that make a terminal act:
+// OSC (clipboard, title, links), DCS, APC, PM and SOS.
+const CONTROL =
+  /\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-_]|[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\u0080-\u009f]|\p{Cf}/gu;
+const clean = (s: string) => s.replace(CONTROL, "").replace(/\r(?!\n)/g, "\n");
+const TERMINAL_STRINGS = /(?:\x1b[\]P^_X]|[\x90\x98\x9d\x9e\x9f])[^\x07\x1b\x9c]*(?:\x07|\x1b\\|\x9c)?/g;
+const quote = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
+// What a box says can be long; only the end of it is kept.
+const tail = (s: string) => (s.length > 65536 ? s.slice(-65536) : s);
+
+const log = (msg: string) => process.stderr.write(`box: ${clean(msg)}\n`);
 function die(msg: string): never {
   log(msg);
   process.exit(1);
@@ -184,7 +196,7 @@ async function cf<T>(token: string, api: string, method = "GET", body?: unknown)
     body: body === undefined ? undefined : JSON.stringify(body),
   });
   const json = (await res.json()) as { success: boolean; errors: unknown; result: T };
-  if (!json.success) throw new Error(`cloudflare ${method} ${api.split("?")[0]}: ${JSON.stringify(json.errors)}`);
+  if (!json.success) throw new Error(`cloudflare ${method} ${api.split("?")[0]} (${res.status}): ${JSON.stringify(json.errors)}`);
   return json.result;
 }
 
@@ -195,10 +207,14 @@ async function zoneOf(token: string, zone: string) {
 }
 
 // Rotating the secret first revokes the token the runner holds, so a copied token can
-// neither keep a connector up nor block the deletion.
+// neither keep a connector up nor block the deletion. Only a tunnel Cloudflare says is gone
+// counts as deleted; any other failure is an error, to be retried.
 async function deleteTunnel(token: string, accountId: string, tunnelId: string) {
   const t = `/accounts/${accountId}/cfd_tunnel/${tunnelId}`;
-  const current = await cf<{ deleted_at: string | null } | null>(token, t).catch(() => null);
+  const current = await cf<{ deleted_at: string | null }>(token, t).catch((e: Error) => {
+    if (/ \(404\): /.test(e.message)) return null;
+    throw e;
+  });
   if (!current || current.deleted_at) return;
   await cf(token, t, "PATCH", { tunnel_secret: randomBytes(32).toString("base64") });
   for (let i = 0; ; i++) {
@@ -212,13 +228,14 @@ async function deleteTunnel(token: string, accountId: string, tunnelId: string) 
   }
 }
 
-// Both steps are safe to repeat, so a `box down` that failed halfway can simply be retried.
+// The tunnel goes first, so its token is revoked even when the DNS record cannot go. Both
+// steps are safe to repeat, so a `box down` that failed halfway can simply be retried.
 async function deleteNamed(token: string, named: NonNullable<Lease["named"]>) {
+  await deleteTunnel(token, named.accountId, named.tunnelId);
   if (named.dnsId)
     await cf(token, `/zones/${named.zoneId}/dns_records/${named.dnsId}`, "DELETE").catch((e: Error) => {
       if (!/"code":81044/.test(e.message)) throw e;
     });
-  await deleteTunnel(token, named.accountId, named.tunnelId);
 }
 
 // Move the box from its public quick tunnel to a tunnel of our own. The token travels
@@ -292,15 +309,28 @@ function verifyBranch(repo: string, owner: string): string {
     if (!isNotFound(e)) throw e;
     return die(`${repo} has no ${BRANCH} branch; run \`box install ${repo}\``);
   }
-  const rules = ghJson<{ type: string }[]>(`repos/${repo}/rules/branches/${BRANCH}`).map((r) => r.type);
-  for (const r of ["update", "deletion", "non_fast_forward"])
-    if (!rules.includes(r)) die(`${repo}:${BRANCH} is not locked (missing ${r} rule); run \`box install ${repo}\``);
+  // Locked: one active ruleset of the repo forbids updating, deleting and force-pushing the
+  // branch, and only admins can bypass it (a bypass in one ruleset leaves the others standing).
+  type Actor = { actor_id: number | null; actor_type: string };
+  const admin = (a: Actor) => (a.actor_type === "RepositoryRole" && a.actor_id === 5) || a.actor_type === "OrganizationAdmin";
+  const rulesets = ghJson<{ ruleset_source_type: string; ruleset_id: number }[]>(`repos/${repo}/rules/branches/${BRANCH}`)
+    .filter((r) => r.ruleset_source_type === "Repository")
+    .map((r) => r.ruleset_id);
+  const locked = [...new Set(rulesets)].some((id) => {
+    const r = ghJson<{ enforcement: string; bypass_actors?: Actor[]; rules: { type: string }[] }>(`repos/${repo}/rulesets/${id}`);
+    const types = r.rules.map((rule) => rule.type);
+    return r.enforcement === "active" && !!r.bypass_actors?.every(admin) && ["update", "deletion", "non_fast_forward"].every((t) => types.includes(t));
+  });
+  if (!locked) die(`${repo}:${BRANCH} is not locked to admins; run \`box install ${repo}\``);
   const file = ghJson<{ content: string }>(`repos/${repo}/contents/${WORKFLOW}?ref=${tip}`);
   const content = Buffer.from(file.content, "base64").toString("utf8");
   const pinned = pinOf(content);
   const needs = ["run-name: agent-box ${{ inputs.lease }}", "pubkey: ${{ inputs.pubkey }}", `github.triggering_actor == '${owner}'`];
-  if (!pinned || needs.some((n) => !content.includes(n)))
-    die(`${repo}:${WORKFLOW} lacks the agent-box step or its dispatch inputs; compare it with template/agent-box.yml`);
+  if (!pinned || !/^permissions:/m.test(content) || needs.some((n) => !content.includes(n)))
+    die(`${repo}:${WORKFLOW} lacks the agent-box step, its dispatch inputs or permissions; compare it with template/agent-box.yml`);
+  // Code on a box can reach the job's token, so it must not be able to write.
+  if (/^\s*permissions:\s*write-all\b|^\s*[\w-]+:\s*write\b/m.test(content))
+    die(`${repo}:${WORKFLOW} grants a write permission, which code on a box could use`);
   const cmp = ghJson<{ status: string; files?: { filename: string }[] }>(`repos/${ACTION}/compare/${pinned}...main`);
   if (cmp.status !== "ahead" && cmp.status !== "identical") die(`${repo} pins ${pinned}, which is not on ${ACTION} main`);
   const files = cmp.files ?? [];
@@ -351,6 +381,7 @@ async function up(args: string[]) {
   ensureState();
   await ensureCloudflared();
   const tip = verifyBranch(repo, c.owner);
+  const notes = notesOf(repo, tip, target);
 
   // Hosted runners come on a mix of CPU generations; --cpu keeps leasing until one matches.
   for (let attempt = 1; ; attempt++) {
@@ -358,8 +389,6 @@ async function up(args: string[]) {
     const model = cpuOf(l);
     if (!cpu || cpu.test(model) || attempt >= tries) {
       if (cpu && !cpu.test(model)) log(`${l.id}: no ${cpuFlag} in ${tries} tries, keeping ${model}`);
-      // Setup steps on the repo's agent-box branch can leave instructions in ~/.box/notes.
-      const notes = clean(ssh(l, "cat ~/.box/notes 2>/dev/null", { timeout: 30_000 }).stdout ?? "").trim();
       for (const line of notes ? notes.split("\n") : []) log(`${l.id}: note: ${line}`);
       log(`${l.id}: ready on ${l.host} (${l.repo} on ${target}, ${model}, up to ${minutes} min, stops after 60 min idle)`);
       console.log(l.id);
@@ -368,6 +397,21 @@ async function up(args: string[]) {
     log(`${l.id}: got ${model}, trying again for ${cpuFlag}`);
     await release(l).catch((e: Error) => log(`${l.id}: ${e.message}; retry with \`box down ${l.id}\``));
   }
+}
+
+// Instructions for the agent come from the verified branch, which only admins can change, and
+// never from the box, where whatever runs can write anything: .github/agent-box/<os>.md, else
+// <windows|linux|macos>.md, else default.md.
+function notesOf(repo: string, tip: string, os: string) {
+  for (const name of new Set([os, os.split("-")[0], "default"])) {
+    try {
+      const file = ghJson<{ content: string }>(`repos/${repo}/contents/.github/agent-box/${name}.md?ref=${tip}`);
+      return Buffer.from(file.content, "base64").toString("utf8").trim();
+    } catch (e) {
+      if (!isNotFound(e)) throw e;
+    }
+  }
+  return "";
 }
 
 function cpuOf(l: Lease) {
@@ -517,21 +561,21 @@ function push(args: string[]) {
   const r = spawnSync(
     "git",
     ["push", "--quiet", "--force", "--no-verify", "--no-follow-tags", "--recurse-submodules=no", "box:src", `${commit}:refs/heads/box`],
-    { stdio: "inherit", env: { ...process.env, GIT_SSH_COMMAND: `ssh -F ${sshConfig(l.id)}`, GIT_SSH_VARIANT: "ssh" } },
+    {
+      stdio: ["ignore", "pipe", "pipe"],
+      encoding: "utf8",
+      env: { ...process.env, GIT_SSH_COMMAND: `ssh -F ${sshConfig(l.id)}`, GIT_SSH_VARIANT: "ssh" },
+    },
   );
-  if (r.status !== 0) die("git push failed");
+  // What git and ssh print comes partly from the box.
+  const said = tail(`${r.stdout ?? ""}${r.stderr ?? ""}`).trim();
+  if (r.status !== 0) die(`git push failed${said ? `: ${said}` : ""}`);
+  if (said) log(said);
   const co = ssh(l, `git -C ~/src checkout -q --force --detach ${commit}`, { timeout: 120_000 });
   if (co.status !== 0) die(`checkout failed: ${clean(co.stderr)}`);
   const shown = changed.slice(0, 20).join(", ") + (changed.length > 20 ? `, … ${changed.length - 20} more` : "");
   log(`${l.id}: ~/src = ${ref}${changed.length ? ` + ${changed.length} changed file(s): ${shown}` : ""}`);
 }
-
-// What comes back from the box is untrusted: when it is not going to a terminal (an agent is
-// reading it), strip escape sequences, control and invisible format characters.
-const CONTROL =
-  /\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-_]|[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\u0080-\u009f]|\p{Cf}/gu;
-const clean = (s: string) => s.replace(CONTROL, "").replace(/\r(?!\n)/g, "\n");
-const quote = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
 
 // The command runs detached on the box, so a dropped tunnel only interrupts the output: the
 // follower reconnects and resumes from the last byte it saw.
@@ -568,6 +612,14 @@ async function run(args: string[]) {
 
   const out = process.stdout;
   const decoder = new StringDecoder("utf8");
+  // On a terminal a trailing ESC waits for the next chunk, so no string can start across two.
+  let held = "";
+  const show = (text: string) => {
+    if (!out.isTTY) return out.write(clean(text));
+    text = held + text;
+    held = text.endsWith("\x1b") ? "\x1b" : "";
+    out.write((held ? text.slice(0, -1) : text).replace(TERMINAL_STRINGS, ""));
+  };
   let offset = 0;
   let failingSince: number | undefined;
   for (;;) {
@@ -580,7 +632,7 @@ async function run(args: string[]) {
       child.stdout.on("data", (chunk: Buffer) => {
         offset += chunk.length;
         received = true;
-        out.write(out.isTTY ? chunk : clean(decoder.write(chunk)));
+        show(decoder.write(chunk));
       });
       child.on("close", resolve);
     });
@@ -592,41 +644,59 @@ async function run(args: string[]) {
     if (Date.now() - failingSince > 10 * 60_000) die("lost the box for 10 minutes; the command may still be running");
     await sleep(3000);
   }
-  if (!out.isTTY) out.write(clean(decoder.end()));
+  show(decoder.end());
   const exit = ssh(l, `cat ${job}/exit 2>/dev/null`, { timeout: 60_000 });
   process.exit(/^\d+/.test(exit.stdout ?? "") ? parseInt(exit.stdout, 10) : 255);
 }
 
 // Files go as one tar stream of the paths, which keep their place under ~/src (the current
-// directory here). Symlinks are followed: a build tree is mostly links into the build system's
-// output base. Between two boxes the stream goes from runner to runner (copyDirect); with `.`,
-// this checkout, or --via-here it comes through this machine, gzip'd at its fastest: debug
-// info shrinks to about a quarter, and the proxied tunnels are the bottleneck.
+// directory here) and must lie below it. On a box symlinks are followed: a build tree is mostly
+// links into the build system's output base. A stream holds whatever its sender likes, so the
+// receiver unpacks only the paths asked for, and this checkout, where a box must not plant
+// hooks or links, takes only plain files and directories. Between two boxes the stream goes
+// from runner to runner (copyDirect); with `.` or --via-here it comes through this machine,
+// gzip'd at its fastest: debug info shrinks to about a quarter, and the proxied tunnels are the
+// bottleneck.
 async function cp(args: string[]) {
-  const [from, to, ...paths] = positional(args, ["--via-here"]);
-  if (!from || !to || paths.length === 0) die("usage: box cp <from> <to> <path>... [--exclude PATTERN]... [--via-here]");
+  const [from, to, ...given] = positional(args, ["--via-here"]);
+  if (!from || !to || given.length === 0) die("usage: box cp <from> <to> <path>... [--exclude PATTERN]... [--via-here]");
   if (from === to) die("box cp copies between two different boxes");
+  const paths = given.map((p) => {
+    const n = path.posix.normalize(p).replace(/\/+$/, "");
+    if (n === "." || n === ".." || n.startsWith("../") || path.posix.isAbsolute(n)) die(`${p} is not a path below ~/src`);
+    return n;
+  });
   const excludes = args.flatMap((a, i) => (a === "--exclude" && args[i + 1] ? [`--exclude=${quote(args[i + 1])}`] : []));
-  const tar = `tar -chf - ${[...excludes, ...paths.map(quote)].join(" ")}`;
-  if (from !== "." && to !== "." && !args.includes("--via-here")) return copyDirect(readyLease(from), readyLease(to), tar);
+  const names = `-- ${paths.map(quote).join(" ")}`;
+  const read = (follow: boolean) => `tar -c${follow ? "h" : ""}f - ${excludes.join(" ")} ${names}`;
+  const unpack = `tar -xf - ${names}`;
+  if (from !== "." && to !== "." && !args.includes("--via-here")) return copyDirect(readyLease(from), readyLease(to), read(true), unpack);
+  // Unpacked aside first: a link in the stream could steer a later file anywhere.
+  const intoCheckout = [
+    "s=$(mktemp -d) || exit 1",
+    `trap 'rm -rf "$s"' EXIT`,
+    `gzip -dc | tar -xf - -C "$s" ${names} || exit 1`,
+    `if [ -n "$(find "$s" ! -type f ! -type d -print -quit)" ]; then echo "refused: the box sent links or special files" >&2; exit 1; fi`,
+    `tar -C "$s" -cf - ${names} | tar -xf -`,
+  ].join("\n");
   const side = (id: string, command: string) =>
     id === "."
-      ? spawn("bash", ["-c", command], { stdio: ["pipe", "pipe", "pipe"] })
-      : spawn("ssh", ["-F", sshConfig(readyLease(id).id), "box", `cd ~/src && ${command}`], { stdio: ["pipe", "pipe", "pipe"] });
+      ? spawn("bash", ["-c", `set -o pipefail\n${command}`], { stdio: ["pipe", "pipe", "pipe"] })
+      : spawn("ssh", ["-F", sshConfig(readyLease(id).id), "box", `cd ~/src && set -o pipefail\n${command}`], { stdio: ["pipe", "pipe", "pipe"] });
   const started = Date.now();
-  const reader = side(from, `set -o pipefail; ${tar} | gzip -1`);
-  const writer = side(to, "set -o pipefail; gzip -dc | tar -xf -");
+  const reader = side(from, `${read(from !== ".")} | gzip -1`);
+  const writer = side(to, to === "." ? intoCheckout : `gzip -dc | ${unpack}`);
   let bytes = 0;
   reader.stdout.on("data", (chunk: Buffer) => (bytes += chunk.length));
   reader.stdout.pipe(writer.stdin);
   const finished = (child: ReturnType<typeof spawn>) => {
     let stderr = "";
-    child.stderr?.on("data", (chunk: Buffer) => (stderr += chunk));
+    child.stderr?.on("data", (chunk: Buffer) => (stderr = tail(stderr + chunk)));
     return new Promise<[number | null, string]>((resolve) => child.on("close", (code) => resolve([code, stderr])));
   };
   const [[readStatus, readError], [writeStatus, writeError]] = await Promise.all([finished(reader), finished(writer)]);
-  if (readStatus !== 0) die(`reading on ${from} failed: ${clean(readError).trim()}`);
-  if (writeStatus !== 0) die(`writing on ${to} failed: ${clean(writeError).trim()}`);
+  if (readStatus !== 0) die(`reading on ${from} failed: ${readError.trim()}`);
+  if (writeStatus !== 0) die(`writing on ${to} failed: ${writeError.trim()}`);
   log(`${from} -> ${to}: ${(bytes / 1048576).toFixed(1)} MB in ${((Date.now() - started) / 1000).toFixed(0)} s`);
 }
 
@@ -635,15 +705,26 @@ async function cp(args: string[]) {
 // copy, which the source accepts once, within ten minutes, for this one tar only, and it
 // checks the source against the host key pinned here. zstd keeps up with a runner-to-runner
 // link, which gzip cannot. A failure is reported, never retried through this machine.
-async function copyDirect(src: Lease, dst: Lease, tar: string) {
+async function copyDirect(src: Lease, dst: Lease, read: string, unpack: string) {
   const tag = `box-cp-${randomBytes(4).toString("hex")}`;
   const dir = `~/.box/cp/${tag}`;
   const user = /^\s*User (\S+)$/m.exec(fs.readFileSync(sshConfig(src.id), "utf8"))?.[1];
   if (!user) die(`no ssh user for ${src.id}`);
   const hostKey = fs.readFileSync(path.join(leaseDir(src.id), "known_hosts"), "utf8");
-  // authorized_keys is root's on Linux and macOS; on Windows the user, an admin, can write it.
-  const keys = "if [ -f /etc/agent-box/authorized_keys ]; then f=/etc/agent-box/authorized_keys s=sudo; else f=/c/ProgramData/agent-box/authorized_keys s=; fi";
-  const unauthorize = `${keys}; k=$(mktemp); if grep -q ' ${tag}$' "$f" && grep -v ' ${tag}$' "$f" > $k && [ -s $k ]; then $s tee "$f" < $k > /dev/null; fi; rm -f $k`;
+  // authorized_keys is root's on Linux and macOS, where it is replaced whole; on Windows the
+  // user, an admin, can write it, and it is rewritten in place to keep its ACL. Concurrent
+  // copies take turns with it, and it is never left empty.
+  const keys = [
+    "if [ -f /etc/agent-box/authorized_keys ]; then f=/etc/agent-box/authorized_keys s=sudo; else f=/c/ProgramData/agent-box/authorized_keys s=; fi",
+    "mkdir -p ~/.box/cp; for i in $(seq 50); do mkdir ~/.box/cp/lock 2>/dev/null && break; sleep 0.1; done",
+  ].join("\n");
+  const unlock = "rmdir ~/.box/cp/lock 2>/dev/null || true";
+  const unauthorize = [
+    keys,
+    `k=$(mktemp); if grep -q ' ${tag}$' "$f" && grep -v ' ${tag}$' "$f" > $k && [ -s $k ]; then`,
+    `  if [ -n "$s" ]; then sudo sh -c 'cat "$1" > "$2.new" && chmod 644 "$2.new" && mv -f "$2.new" "$2"' - $k "$f"; else cat $k > "$f"; fi`,
+    `fi; rm -f $k; ${unlock}`,
+  ].join("\n");
   const cleanup = () => {
     ssh(src, `${unauthorize}; rm -rf ${dir}`, { timeout: 30_000 });
     ssh(dst, `rm -rf ${dir}`, { timeout: 30_000 });
@@ -660,11 +741,17 @@ async function copyDirect(src: Lease, dst: Lease, tar: string) {
     if (made.status !== 0 || !new RegExp(`^ssh-ed25519 [A-Za-z0-9+/]+={0,2} ${tag}$`).test(pubkey))
       throw new Error(`cannot make a key on ${dst.id}: ${clean(made.stderr ?? "").trim()}`);
 
-    // The source's forced command first takes its own key out again: one login only.
-    const send = [unauthorize, "[ -f ~/.box/env ] && . ~/.box/env", `cd ~/src && set -o pipefail && ${tar} | zstd -1 -T0 -q`].join("\n");
+    // The source's forced command runs once (a login can open several sessions) and first takes
+    // its key out again, so there is no second login either.
+    const send = [
+      `mkdir ${dir}/used 2>/dev/null || exit 1`,
+      unauthorize,
+      "[ -f ~/.box/env ] && . ~/.box/env",
+      `cd ~/src && set -o pipefail && ${read} | zstd -1 -T0 -q`,
+    ].join("\n");
     const expiry = new Date(Date.now() + 10 * 60_000).toISOString().replace(/[-:T]/g, "").slice(0, 12);
     const line = `restrict,command="bash ${dir}/send",expiry-time="${expiry}Z" ${pubkey}`;
-    const auth = ssh(src, `set -e; mkdir -p ${dir}; IFS= read -r line; cat > ${dir}/send; ${keys}; printf '%s\\n' "$line" | $s tee -a "$f" > /dev/null`, {
+    const auth = ssh(src, `set -e; mkdir -p ${dir}; IFS= read -r line; cat > ${dir}/send\n${keys}\nprintf '%s\\n' "$line" | $s tee -a "$f" > /dev/null; ${unlock}`, {
       input: `${line}\n${send}\n`,
       timeout: 60_000,
     });
@@ -683,7 +770,7 @@ async function copyDirect(src: Lease, dst: Lease, tar: string) {
         `-o StrictHostKeyChecking=yes -o UserKnownHostsFile=$d/known_hosts -o GlobalKnownHostsFile=/dev/null -o HostKeyAlias=agent-box-${src.id}`,
         "-o UpdateHostKeys=no -o ConnectTimeout=60 -o ServerAliveInterval=15 -o ServerAliveCountMax=4",
         `-o "ProxyCommand=$c access ssh --hostname %h" -l ${quote(user)} ${quote(src.host!)}`,
-        "| dd bs=1048576 2> $d/dd | zstd -dcq | tar -xf -",
+        `| dd bs=1048576 2> $d/dd | zstd -dcq | ${unpack}`,
       ].join(" "),
       // A killed shell can still exit 0 on Windows, so success is said, not inferred.
       "s=$?; kill $! 2>/dev/null; [ $s = 0 ] && echo \"copied $(grep -o '^[0-9]* bytes' $d/dd)\"; exit $s",
@@ -692,11 +779,11 @@ async function copyDirect(src: Lease, dst: Lease, tar: string) {
     const child = spawn("ssh", ["-F", sshConfig(dst.id), "box", pull], { stdio: ["pipe", "pipe", "pipe"] });
     let out = "";
     let err = "";
-    child.stdout.on("data", (chunk: Buffer) => (out += chunk));
-    child.stderr.on("data", (chunk: Buffer) => (err += chunk));
+    child.stdout.on("data", (chunk: Buffer) => (out = tail(out + chunk)));
+    child.stderr.on("data", (chunk: Buffer) => (err = tail(err + chunk)));
     const status = await new Promise<number | null>((resolve) => child.on("close", resolve));
     const copied = /^copied (\d+) bytes$/m.exec(out);
-    if (status !== 0 || !copied) throw new Error(`${src.id} -> ${dst.id} failed: ${clean(err).trim() || `exit ${status}`}`);
+    if (status !== 0 || !copied) throw new Error(`${src.id} -> ${dst.id} failed: ${err.trim() || `exit ${status}`}`);
     return { bytes: +copied[1], seconds: (Date.now() - started) / 1000 };
   };
 
@@ -716,7 +803,11 @@ function shell(args: string[]) {
 // The stop file ends the run cleanly; the cancel covers a runner that ignores it.
 async function release(l: Lease) {
   if (l.host && ssh(l, "touch ~/.box/stop", { timeout: 20_000 }).status === 0) log(`${l.id}: stopping`);
-  if (l.runId) spawnSync("gh", ["run", "cancel", String(l.runId), "-R", l.repo], { stdio: "ignore" });
+  if (l.runId) {
+    // An ended run cannot be cancelled; any other failure keeps the lease for a retry.
+    const cancel = spawnSync("gh", ["run", "cancel", String(l.runId), "-R", l.repo], { stdio: "ignore" });
+    if (cancel.status !== 0 && !(await runStatus(l)).startsWith("ended")) throw new Error(`cannot cancel run ${l.runId}`);
+  }
   if (fs.existsSync(sshConfig(l.id))) closeMaster(l);
   if (l.named) {
     const token = cloudflareToken(config());
@@ -737,12 +828,17 @@ async function down(args: string[]) {
 const LEASE_MAX_MS = 30 * 3600_000;
 const expired = (l: Lease) => Date.now() - Date.parse(l.created) > LEASE_MAX_MS;
 
-// No box to stop and no run to cancel: only what this machine keeps of the lease goes.
+// No box to stop and no run to cancel: only what this machine keeps of the lease goes, and
+// only once its tunnel is deleted (until then a copied tunnel token may still work).
 async function forget(l: Lease) {
   if (fs.existsSync(sshConfig(l.id))) closeMaster(l);
   if (l.named) {
     const token = cloudflareToken(config());
-    if (token) await deleteNamed(token, l.named).catch((e: Error) => log(`${l.id}: ${e.message}`));
+    const failed = token ? await deleteNamed(token, l.named).then(() => undefined, (e: Error) => e.message) : "no cloudflare token";
+    if (failed) {
+      log(`${l.id}: kept until its tunnel ${l.named.tunnelId} is deleted: ${failed}`);
+      return;
+    }
   }
   fs.rmSync(leaseDir(l.id), { recursive: true, force: true });
 }

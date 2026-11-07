@@ -1,6 +1,8 @@
 # Installed by `box install`, which later only moves the agent-box pin. Add whatever setup the
 # box should start with before the last step: the checkout, toolchain and cache restore steps of
-# this repo's CI, so a box builds where and how CI does.
+# this repo's CI, so a box builds where and how CI does. Instructions for the agent go in
+# .github/agent-box/<os>.md, <linux|macos|windows>.md or default.md on this branch; `box up`
+# prints the first that exists.
 name: agent-box
 run-name: agent-box ${{ inputs.lease }}
 on:
