@@ -1,11 +1,11 @@
 # Windows. Nothing secret ever reaches this runner through GitHub: the only input is a public
 # key, and everything this script publishes (box.json) is public too.
-# The image's OpenSSH service crashes when pointed at another config, so it is stopped and
-# sshd runs as this user instead (it can then only log in this user, which is all we need),
-# on loopback, with our host key, our authorized key and Git Bash as the login shell.
+# The image's OpenSSH service crashes when pointed at another config, so it is stopped and a
+# current portable sshd runs as this user instead (it can then only log in this user, which is
+# all we need), on loopback, with our host key, our authorized key and Git Bash as the shell.
 $ErrorActionPreference = 'Stop'
-$version = '2026.9.3'
-$sha256 = 'f096265ec2fcbe9bb6e2d64268db167ced3fcbb83d894bdb9e2fcdb26f2ea7e2'
+$version = '2026.10.7'
+$sha256 = '2493dbc168923bb3e59e5e7716f71deced92992eea9acd6e9d74f84ac7751343'
 
 if ($env:PUBKEY -cnotmatch '^ssh-ed25519 [A-Za-z0-9+/]+={0,2}( [A-Za-z0-9._@-]+)?$') {
   throw 'pubkey must be a single ssh-ed25519 public key'
@@ -62,19 +62,16 @@ PermitUserEnvironment no
 New-ItemProperty -Path 'HKLM:\SOFTWARE\OpenSSH' -Name DefaultShell -Value 'C:\Program Files\Git\bin\bash.exe' -PropertyType String -Force | Out-Null
 Lock "$etc\sshd_config"
 Stop-Service sshd -ErrorAction SilentlyContinue
-$sshd = "$env:WINDIR\System32\OpenSSH\sshd.exe"
-if (-not (Test-Path $sshd)) {
-  # The Arm image has no OpenSSH Server, and installing the Windows capability takes over ten
-  # minutes; the same 9.5 release as a portable zip takes seconds.
-  $zip = @{
-    ARM64 = @{ name = 'OpenSSH-ARM64'; sha256 = 'e6a7e39266485eb98ce5396c61a9931e7826502c71bf5234dfdda5bee3882f23' }
-    AMD64 = @{ name = 'OpenSSH-Win64'; sha256 = 'bd48fe985d400402c278c485db20e6a82bc4c7f7d8e0ef5a81128f523096530c' }
-  }[$env:PROCESSOR_ARCHITECTURE]
-  Invoke-WebRequest -UseBasicParsing -OutFile "$etc\openssh.zip" "https://github.com/PowerShell/Win32-OpenSSH/releases/download/v9.5.0.0p1-Beta/$($zip.name).zip"
-  if ((Get-FileHash -Algorithm SHA256 "$etc\openssh.zip").Hash.ToLowerInvariant() -ne $zip.sha256) { throw 'OpenSSH checksum mismatch' }
-  Expand-Archive "$etc\openssh.zip" $etc -Force
-  $sshd = "$etc\$($zip.name)\sshd.exe"
-}
+# The image's OpenSSH is 9.5 on x64 and missing on Arm, where installing the Windows capability
+# takes over ten minutes; the current release as a portable zip takes seconds.
+$zip = @{
+  ARM64 = @{ name = 'OpenSSH-ARM64'; sha256 = 'd2b1928225479fec9e0c938f527fdb5ed676446cca1bbcc5af84aca1f272842e' }
+  AMD64 = @{ name = 'OpenSSH-Win64'; sha256 = 'b67ff8becd203502190ec42ac7787c24c2cd3325ed7700485fe7a1c83d2a7957' }
+}[$env:PROCESSOR_ARCHITECTURE]
+Invoke-WebRequest -UseBasicParsing -OutFile "$etc\openssh.zip" "https://github.com/PowerShell/Win32-OpenSSH/releases/download/10.4.0.0p1-Preview/$($zip.name).zip"
+if ((Get-FileHash -Algorithm SHA256 "$etc\openssh.zip").Hash.ToLowerInvariant() -ne $zip.sha256) { throw 'OpenSSH checksum mismatch' }
+Expand-Archive "$etc\openssh.zip" $etc -Force
+$sshd = "$etc\$($zip.name)\sshd.exe"
 $check = & $sshd -t -f "$etc\sshd_config" 2>&1
 if ($LASTEXITCODE -ne 0) { throw "sshd_config rejected: $check" }
 Set-Content -Path "$box\sshd.pid" -Value (Spawn "`"$sshd`" -f `"$etc\sshd_config`" -E `"$box\sshd.log`"")
@@ -87,6 +84,14 @@ for ($i = 0; -not (Get-NetTCPConnection -LocalAddress 127.0.0.1 -LocalPort 2222 
 $exe = "$box\cloudflared.exe"
 Invoke-WebRequest -UseBasicParsing -OutFile $exe "https://github.com/cloudflare/cloudflared/releases/download/$version/cloudflared-windows-amd64.exe"
 if ((Get-FileHash -Algorithm SHA256 $exe).Hash.ToLowerInvariant() -ne $sha256) { throw 'cloudflared checksum mismatch' }
+
+# box cp streams through zstd; the x64 image has it, the Arm one may not.
+if (-not (Get-Command zstd -ErrorAction SilentlyContinue)) {
+  Invoke-WebRequest -UseBasicParsing -OutFile "$etc\zstd.zip" 'https://github.com/facebook/zstd/releases/download/v1.5.7/zstd-v1.5.7-win64.zip'
+  if ((Get-FileHash -Algorithm SHA256 "$etc\zstd.zip").Hash.ToLowerInvariant() -ne 'acb4e8111511749dc7a3ebedca9b04190e37a17afeb73f55d4425dbf0b90fad9') { throw 'zstd checksum mismatch' }
+  Expand-Archive "$etc\zstd.zip" $etc -Force
+  Add-Content -Path $env:GITHUB_PATH -Value "$etc\zstd-v1.5.7-win64"
+}
 
 Set-Content -Path "$box\quick.pid" -Value (Spawn "`"$exe`" tunnel --no-autoupdate --logfile `"$box\quick.log`" --url ssh://127.0.0.1:2222")
 $tunnel = $null

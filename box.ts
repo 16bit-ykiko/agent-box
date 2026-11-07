@@ -18,7 +18,7 @@ const WORKFLOW = ".github/workflows/agent-box.yml";
 const HOME = os.homedir();
 const STATE = path.join(process.env.XDG_STATE_HOME ?? path.join(HOME, ".local/state"), "agent-box");
 const OSES = ["linux", "linux-arm", "macos", "macos-intel", "windows", "windows-arm"];
-const CLOUDFLARED = { version: "2026.9.3", sha256: "77e26d8d900e0b8469f416239d14b5f296525fdf79fee6f511ef55609e3fbac2" };
+const CLOUDFLARED = { version: "2026.10.7", sha256: "1f99fb518b83dec2ba8d870a7cc991d82a77e6196295a3d2754ba17ab9f91872" };
 
 type Config = { owner: string; zone?: string; cloudflareTokenFile: string };
 type Lease = {

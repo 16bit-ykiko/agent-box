@@ -3,12 +3,12 @@
 # a public key, and everything this script publishes (box.json) is public too.
 set -euo pipefail
 
-CLOUDFLARED_VERSION=2026.9.3
+CLOUDFLARED_VERSION=2026.10.7
 case "$(uname -s)-$(uname -m)" in
-  Linux-x86_64) asset=cloudflared-linux-amd64 sum=77e26d8d900e0b8469f416239d14b5f296525fdf79fee6f511ef55609e3fbac2 ;;
-  Linux-aarch64) asset=cloudflared-linux-arm64 sum=aaeb2d7d0da3614634c7e03ab13487a1522c2e79165ed2929cfe23d5e95b326d ;;
-  Darwin-x86_64) asset=cloudflared-darwin-amd64.tgz sum=ab588b3b4db9cdb4476c30a3db2a72635b1d8327d44741fee6799a0f37b0ec07 ;;
-  Darwin-arm64) asset=cloudflared-darwin-arm64.tgz sum=5472c1a01c84bc31b3021056a73b4e5774ddddefc572124ea8fdf6c340639f32 ;;
+  Linux-x86_64) asset=cloudflared-linux-amd64 sum=1f99fb518b83dec2ba8d870a7cc991d82a77e6196295a3d2754ba17ab9f91872 ;;
+  Linux-aarch64) asset=cloudflared-linux-arm64 sum=3df43aedc9ff291d1735b5cb576cb97e0b157488796db2e32b28aecabb445775 ;;
+  Darwin-x86_64) asset=cloudflared-darwin-amd64.tgz sum=5c55e77da7012cebca19170357e196176c48c9647cc2ead404702fa125ddbd86 ;;
+  Darwin-arm64) asset=cloudflared-darwin-arm64.tgz sum=2136431d5eb467bf447d2ee514b713e192719b143aec1d9e09bf7dc290d5bb12 ;;
   *) echo "unsupported runner: $(uname -s) $(uname -m)"; exit 1 ;;
 esac
 key_re='^ssh-ed25519 [A-Za-z0-9+/]+={0,2}( [A-Za-z0-9._@-]+)?$'
@@ -21,6 +21,10 @@ install -m 755 "$(dirname "$0")/job.sh" "$box/job"
 ln -sfn "$GITHUB_WORKSPACE" ~/src
 
 [[ -x /usr/sbin/sshd ]] || { sudo apt-get update -qq && sudo apt-get install -y -qq openssh-server >/dev/null; }
+# box cp streams through zstd; the images have it, but not every image promises to.
+if ! command -v zstd >/dev/null; then
+  if [[ $(uname -s) == Darwin ]]; then HOMEBREW_NO_AUTO_UPDATE=1 brew install -q zstd; else sudo apt-get update -qq && sudo apt-get install -y -qq zstd >/dev/null; fi
+fi
 sudo install -d -m 755 /etc/agent-box
 sudo ssh-keygen -q -t ed25519 -N '' -C agent-box -f /etc/agent-box/host_key
 printf 'restrict,pty %s\n' "$PUBKEY" | sudo tee /etc/agent-box/authorized_keys >/dev/null
