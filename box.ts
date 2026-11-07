@@ -75,8 +75,6 @@ function ghJson<T>(api: string): T {
   return JSON.parse(gh(["api", api])) as T;
 }
 
-// ---------------------------------------------------------------- leases
-
 const leaseDir = (id: string) => path.join(STATE, "leases", id);
 const sshConfig = (id: string) => path.join(leaseDir(id), "ssh_config");
 
@@ -102,8 +100,6 @@ function allLeases(): Lease[] {
     .filter((id) => fs.existsSync(path.join(dir, id, "lease.json")))
     .map((id) => loadLease(id));
 }
-
-// ---------------------------------------------------------------- ssh
 
 function writeSshConfig(l: Lease, host: string, user: string) {
   const dir = leaseDir(l.id);
@@ -158,8 +154,6 @@ function closeMaster(l: Lease) {
   spawnSync("ssh", ["-F", sshConfig(l.id), "-O", "exit", "box"], { stdio: "ignore" });
 }
 
-// ---------------------------------------------------------------- cloudflared (local)
-
 function cloudflaredPath() {
   return path.join(STATE, "bin", `cloudflared-${CLOUDFLARED.version}`);
 }
@@ -178,8 +172,6 @@ async function ensureCloudflared() {
   fs.writeFileSync(tmp, bytes, { mode: 0o700, flag: "wx" });
   fs.renameSync(tmp, file);
 }
-
-// ---------------------------------------------------------------- cloudflare api
 
 function cloudflareToken(c: Config): string | undefined {
   return c.zone && fs.existsSync(c.cloudflareTokenFile) ? fs.readFileSync(c.cloudflareTokenFile, "utf8").trim() : undefined;
@@ -275,8 +267,6 @@ async function upgradeToNamed(l: Lease, c: Config, token: string, user: string) 
   ssh(l, "bash ~/.box/job untunnel", { timeout: 20_000 });
 }
 
-// ---------------------------------------------------------------- workflow on the repo
-
 function renderWorkflow(owner: string, sha: string) {
   return fs
     .readFileSync(path.join(HERE, "template/agent-box.yml"), "utf8")
@@ -345,8 +335,6 @@ function parseBoxJson(dir: string) {
   if (typeof user !== "string" || !/^[a-z_][a-z0-9_-]*$/.test(user)) throw new Error("unexpected user");
   return { host, hostKey, user };
 }
-
-// ---------------------------------------------------------------- commands
 
 async function up(args: string[]) {
   const [repo] = positional(args);
