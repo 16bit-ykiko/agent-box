@@ -2,13 +2,14 @@
 // box — lease a GitHub Actions runner and work on it over ssh.
 // Secrets stay on this machine: GitHub only ever sees a public key, and with named tunnels
 // the runner gets a tunnel token that is revoked with the lease.
-import { execFileSync, spawn, spawnSync } from "node:child_process";
+import { execFile, execFileSync, spawn, spawnSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ACTION = "16bit-ykiko/agent-box";
@@ -663,29 +664,63 @@ async function down(args: string[]) {
   await release(l).catch((e: Error) => die(`${l.id}: ${e.message}`));
 }
 
-function runStatus(l: Lease) {
+// GitHub cancels a job queued for 24 hours and stops one that ran for 6: a lease older than
+// 30 hours has no runner left, so it is forgotten without asking GitHub.
+const LEASE_MAX_MS = 30 * 3600_000;
+const expired = (l: Lease) => Date.now() - Date.parse(l.created) > LEASE_MAX_MS;
+
+// No box to stop and no run to cancel: only what this machine keeps of the lease goes.
+async function forget(l: Lease) {
+  if (fs.existsSync(sshConfig(l.id))) closeMaster(l);
+  if (l.named) {
+    const token = cloudflareToken(config());
+    if (token) await deleteNamed(token, l.named).catch((e: Error) => log(`${l.id}: ${e.message}`));
+  }
+  fs.rmSync(leaseDir(l.id), { recursive: true, force: true });
+}
+
+async function dropExpired(leases: Lease[]): Promise<Lease[]> {
+  const old = leases.filter(expired);
+  for (const l of old) await forget(l);
+  if (old.length) log(`dropped ${old.length} expired lease${old.length === 1 ? "" : "s"}`);
+  return leases.filter((l) => !expired(l));
+}
+
+const execFileAsync = promisify(execFile);
+async function runStatus(l: Lease) {
   if (!l.runId) return "starting";
   try {
-    const r = ghJson<{ status: string; conclusion: string | null }>(`repos/${l.repo}/actions/runs/${l.runId}`);
+    const { stdout } = await execFileAsync("gh", ["api", `repos/${l.repo}/actions/runs/${l.runId}`], { timeout: 30_000 });
+    const r = JSON.parse(stdout) as { status: string; conclusion: string | null };
     return r.status === "completed" ? `ended (${r.conclusion})` : r.status;
   } catch {
     return "unknown";
   }
 }
 
-function ls() {
-  for (const l of allLeases()) {
+// The leases still running, with their run's status; those whose run ended are forgotten.
+async function liveLeases(): Promise<[Lease, string][]> {
+  const leases = await dropExpired(allLeases());
+  const statuses = await Promise.all(leases.map(runStatus));
+  const ended = leases.filter((_, i) => statuses[i].startsWith("ended"));
+  for (const l of ended) await forget(l);
+  if (ended.length) log(`dropped ${ended.length} lease${ended.length === 1 ? "" : "s"} whose run ended`);
+  return leases.map((l, i): [Lease, string] => [l, statuses[i]]).filter(([, s]) => !s.startsWith("ended"));
+}
+
+async function ls() {
+  for (const [l, status] of await liveLeases()) {
     const age = Math.round((Date.now() - Date.parse(l.created)) / 60_000);
-    console.log(`${l.id}  ${l.repo.padEnd(28)} ${(l.os ?? "linux").padEnd(12)}${String(age).padStart(4)} min  ${runStatus(l).padEnd(14)} ${l.host ?? "-"}`);
+    console.log(`${l.id}  ${l.repo.padEnd(28)} ${(l.os ?? "linux").padEnd(12)}${String(age).padStart(4)} min  ${status.padEnd(14)} ${l.host ?? "-"}`);
   }
 }
 
-// Release leases whose runner is gone, then any agent-box tunnel or DNS record no lease here
-// owns and that is older than the longest possible lease (it may be another machine's).
+// Forget leases whose runner is gone and release those that never started, then any
+// agent-box tunnel or DNS record no lease here owns and that is older than the longest
+// possible lease (it may be another machine's).
 async function gc() {
-  for (const l of allLeases()) {
-    const age = Date.now() - Date.parse(l.created);
-    if (runStatus(l).startsWith("ended") || (!l.runId && age > 15 * 60_000))
+  for (const [l] of await liveLeases()) {
+    if (!l.runId && Date.now() - Date.parse(l.created) > 15 * 60_000)
       await release(l).catch((e: Error) => log(`${l.id}: ${e.message}`));
   }
   const c = config();
@@ -798,8 +833,8 @@ const USAGE = `usage:
                                   . for this checkout), following symlinks
   box ssh <id>                    interactive shell
   box down <id>                   release the runner and its tunnel
-  box ls                          list leases
-  box gc                          release ended leases and orphaned tunnels`;
+  box ls                          list running leases; forget ended ones
+  box gc                          also release leases that never started, and orphaned tunnels`;
 
 const [cmd, ...rest] = process.argv.slice(2);
 process.on("uncaughtException", (e: Error & { stderr?: unknown }) => die(String(e.stderr || e.message).trim()));
@@ -826,7 +861,7 @@ switch (cmd) {
     await down(rest);
     break;
   case "ls":
-    ls();
+    await ls();
     break;
   case "gc":
     await gc();
