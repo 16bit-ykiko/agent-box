@@ -27,7 +27,7 @@ after 60 minutes without an ssh connection or at `--minutes` (default and max 34
   staged but not committed count as tracked and are sent; the files that differ from HEAD
   are listed. It refuses to push from a checkout without a GitHub remote for the leased repo.
 - **`box cp`** copies paths below `~/src` (or this checkout, `.`) as a tar, following
-  symlinks on a box but not here, where no link on the way may lead out of the checkout. The
+  symlinks on a box but not here, where no path may go through a link. The
   receiver unpacks only the paths asked for, whatever the sender put in the stream, and this
   checkout takes only plain files and directories and never a `.git` or `.claude`, so a box
   can plant neither hooks nor links here. From one box to another the stream never touches
@@ -62,7 +62,9 @@ usually the checkout, toolchain and cache restore steps of the repo's CI: `~/src
 Instructions for the agent go in `.github/agent-box/<os>.md`, `<linux|macos|windows>.md` or
 `default.md` on the branch; `box up` prints the first that exists, read from GitHub, never from
 the box. `box up` checks only that the branch is locked by a ruleset only admins can bypass,
-keeps the dispatch inputs, grants no write permission and pins current runner code. What those steps do cannot reach this machine: a box is untrusted anyway. Rulesets
+keeps the dispatch inputs, pins current runner code and grants no write permission: the
+workflow says `permissions: {}` or `permissions:` over `  scope: read` lines, and mentions
+permissions nowhere else. What those steps do cannot reach this machine: a box is untrusted anyway. Rulesets
 can only exempt roles, so every admin of the repo can change the branch.
 
 Local state (keys, ssh config, leases) is in `~/.local/state/agent-box`.

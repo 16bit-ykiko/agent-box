@@ -10,6 +10,7 @@ import path from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
+import { inflateRawSync } from "node:zlib";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ACTION = "16bit-ykiko/agent-box";
@@ -33,14 +34,15 @@ type Lease = {
 
 // What comes back from the box is untrusted. All that box itself prints goes through clean(),
 // which strips escape sequences, control and invisible format characters. `box run` on a
-// terminal keeps complete CSI sequences (colours, cursor movement) and drops every other escape
-// whole: OSC (clipboard, title, links), DCS, APC, PM, SOS and lone ESCs, so that what is left
-// can never join into a new one.
+// terminal keeps the CSI sequences that colour text, erase it or move the cursor (progress
+// lines) and drops every other escape whole: OSC (clipboard, title, links), DCS, APC, PM, SOS,
+// modes, reports the terminal would type back as input, window operations and lone ESCs, so
+// that what is left can never join into a new one.
 const CONTROL =
   /\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-_]|[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\u0080-\u009f]|\p{Cf}/gu;
 const clean = (s: string) => s.replace(CONTROL, "").replace(/\r(?!\n)/g, "\n");
 const TERMINAL = /\x1b\[[0-?]*[ -/]*[@-~]|(?:\x1b[\]P^_X]|[\x90\x98\x9d\x9e\x9f])[^\x07\x1b\x9c]*(?:\x07|\x1b\\|\x9c)?|\x1b|\x9b/g;
-const forTerminal = (s: string) => s.replace(TERMINAL, (m) => (m.startsWith("\x1b[") ? m : ""));
+const forTerminal = (s: string) => s.replace(TERMINAL, (m) => (/^\x1b\[[0-9;]*[A-HJKSTfm]$/.test(m) ? m : ""));
 const quote = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
 // What a box says can be long; only the end of it is kept.
 const tail = (s: string) => (s.length > 65536 ? s.slice(-65536) : s);
@@ -139,6 +141,7 @@ function writeSshConfig(l: Lease, host: string, user: string) {
     "  ControlMaster auto",
     `  ControlPath ${dir}/cm`,
     "  ControlPersist 10m",
+    "  ConnectTimeout 60",
     "  ServerAliveInterval 30",
     "  ServerAliveCountMax 4",
   ];
@@ -328,11 +331,10 @@ function verifyBranch(repo: string, owner: string): string {
   const content = Buffer.from(file.content, "base64").toString("utf8");
   const pinned = pinOf(content);
   const needs = ["run-name: agent-box ${{ inputs.lease }}", "pubkey: ${{ inputs.pubkey }}", `github.triggering_actor == '${owner}'`];
-  if (!pinned || !/^permissions:/m.test(content) || needs.some((n) => !content.includes(n)))
-    die(`${repo}:${WORKFLOW} lacks the agent-box step, its dispatch inputs or permissions; compare it with template/agent-box.yml`);
-  // Code on a box can reach the job's token, so it must not be able to write.
-  if (/:\s*["']?write(?:-all)?["']?\s*(?:[,}#]|$)/m.test(content))
-    die(`${repo}:${WORKFLOW} grants a write permission, which code on a box could use`);
+  if (!pinned || needs.some((n) => !content.includes(n)))
+    die(`${repo}:${WORKFLOW} lacks the agent-box step or its dispatch inputs; compare it with template/agent-box.yml`);
+  if (!readOnly(content))
+    die(`${repo}:${WORKFLOW} must say \`permissions: {}\` or \`permissions:\` over \`  scope: read\` lines, and mention permissions nowhere else`);
   const cmp = ghJson<{ status: string; files?: { filename: string }[] }>(`repos/${ACTION}/compare/${pinned}...main`);
   if (cmp.status !== "ahead" && cmp.status !== "identical") die(`${repo} pins ${pinned}, which is not on ${ACTION} main`);
   const files = cmp.files ?? [];
@@ -341,28 +343,61 @@ function verifyBranch(repo: string, owner: string): string {
   return tip;
 }
 
-// The artifact comes from the runner, so it is unpacked away from the lease directory and
-// only box.json, with plain string fields, is accepted.
-async function readBoxArtifact(repo: string, runId: number) {
+// Code on a box can reach the job's token, so it must not be able to write. Permissions are
+// read in the plain forms the template uses and nowhere else in the file: telling every other
+// YAML spelling apart would take a YAML parser.
+function readOnly(workflow: string) {
+  const lines = workflow.split("\n");
+  const at = lines.flatMap((line, i) => (/permissions/i.test(line) ? [i] : []));
+  if (at.length !== 1) return false;
+  if (/^permissions: (?:\{\}|read-all)\s*$/.test(lines[at[0]])) return true;
+  if (!/^permissions:\s*$/.test(lines[at[0]])) return false;
+  let end = at[0] + 1;
+  while (/^ {2}[a-z-]+: (?:read|none)\s*(?:#.*)?$/.test(lines[end] ?? "")) end++;
+  return end > at[0] + 1 && !/^\s+\S/.test(lines[end] ?? "");
+}
+
+// The artifact comes from the runner. It is fetched by the id that was size-checked, kept in
+// memory, and only a single box.json of at most 64 KB, with plain string fields, is accepted.
+async function readBoxArtifact(repo: string, id: number) {
   for (let attempt = 1; ; attempt++) {
-    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "agent-box-"));
+    let zip: Buffer;
     try {
-      gh(["run", "download", String(runId), "-R", repo, "-n", "box", "-D", tmp]);
-      return parseBoxJson(tmp);
+      zip = execFileSync("gh", ["api", `repos/${repo}/actions/artifacts/${id}/zip`], { stdio: ["ignore", "pipe", "pipe"], maxBuffer: 65536 });
     } catch (e) {
       if (attempt >= 5 || !(e as { stderr?: unknown }).stderr) throw e;
       await sleep(3000);
-    } finally {
-      fs.rmSync(tmp, { recursive: true, force: true });
+      continue;
     }
+    return parseBoxJson(unzipOne(zip, "box.json", 65536));
   }
 }
 
-function parseBoxJson(dir: string) {
-  const files = fs.readdirSync(dir);
-  if (files.length !== 1 || files[0] !== "box.json") throw new Error(`unexpected artifact contents: ${files.join(", ")}`);
-  if (fs.lstatSync(path.join(dir, "box.json")).size > 65536) throw new Error("box.json is too big");
-  const { host, hostKey, user } = JSON.parse(fs.readFileSync(path.join(dir, "box.json"), "utf8")) as Record<string, unknown>;
+function unzipOne(zip: Buffer, name: string, max: number) {
+  const end = zip.lastIndexOf(Buffer.from("PK\x05\x06", "latin1"));
+  if (end < 0 || zip.readUInt16LE(end + 10) !== 1) throw new Error("the artifact must hold one file");
+  const entry = zip.readUInt32LE(end + 16);
+  const nameLength = zip.readUInt16LE(entry + 28);
+  if (zip.readUInt32LE(entry) !== 0x02014b50 || zip.toString("latin1", entry + 46, entry + 46 + nameLength) !== name)
+    throw new Error(`the artifact must hold only ${name}`);
+  const local = zip.readUInt32LE(entry + 42);
+  if (zip.readUInt32LE(local) !== 0x04034b50) throw new Error("unexpected artifact");
+  const start = local + 30 + zip.readUInt16LE(local + 26) + zip.readUInt16LE(local + 28);
+  const data = zip.subarray(start, start + zip.readUInt32LE(entry + 20));
+  const method = zip.readUInt16LE(entry + 10);
+  if (method !== 0 && method !== 8) throw new Error("unexpected artifact compression");
+  let raw = data;
+  try {
+    if (method === 8) raw = inflateRawSync(data, { maxOutputLength: max });
+  } catch {
+    throw new Error(`${name} is too big or broken`);
+  }
+  if (raw.length > max) throw new Error(`${name} is too big`);
+  return raw.toString("utf8");
+}
+
+function parseBoxJson(json: string) {
+  const { host, hostKey, user } = JSON.parse(json) as Record<string, unknown>;
   if (typeof host !== "string" || !/^[a-z0-9-]+\.trycloudflare\.com$/.test(host)) throw new Error("unexpected tunnel host");
   if (typeof hostKey !== "string" || !/^ssh-ed25519 [A-Za-z0-9+/]+={0,2}$/.test(hostKey)) throw new Error("unexpected host key");
   if (typeof user !== "string" || !/^[a-z_][a-z0-9_-]*$/.test(user)) throw new Error("unexpected user");
@@ -428,6 +463,12 @@ function cpuOf(l: Lease) {
   return `${clean(name[0] ?? "").trim() || "unknown CPU"}, ${clean(name[1] ?? "").trim()} vCPU`;
 }
 
+type Run = { id: number; display_title: string; head_sha: string; path: string; event: string; status: string; actor: { login: string }; html_url: string };
+const findRun = (l: Lease) =>
+  ghJson<{ workflow_runs: Run[] }>(`repos/${l.repo}/actions/runs?branch=${BRANCH}&event=workflow_dispatch&per_page=30`).workflow_runs.find(
+    (r) => r.display_title === `agent-box ${l.id}`,
+  );
+
 async function lease(repo: string, target: string, minutes: string, c: Config, tip: string): Promise<Lease> {
   const l: Lease = { id: randomBytes(5).toString("hex"), repo, os: target, created: new Date().toISOString() };
   const dir = leaseDir(l.id);
@@ -442,12 +483,10 @@ async function lease(repo: string, target: string, minutes: string, c: Config, t
     });
     log(`${l.id}: dispatched on ${l.repo}, waiting for a runner`);
 
-    type Run = { id: number; display_title: string; head_sha: string; path: string; event: string; status: string; actor: { login: string }; html_url: string };
     let run: Run | undefined;
     for (let i = 0; i < 40 && !run; i++) {
       await sleep(3000);
-      const runs = ghJson<{ workflow_runs: Run[] }>(`repos/${l.repo}/actions/runs?branch=${BRANCH}&event=workflow_dispatch&per_page=30`);
-      run = runs.workflow_runs.find((r) => r.display_title === `agent-box ${l.id}`);
+      run = findRun(l);
     }
     if (!run) throw new Error("the run never showed up");
     if (run.head_sha !== tip || run.path !== WORKFLOW || run.actor.login !== c.owner)
@@ -458,10 +497,10 @@ async function lease(repo: string, target: string, minutes: string, c: Config, t
     let box: { host: string; hostKey: string; user: string } | undefined;
     for (let i = 0; i < 100 && !box; i++) {
       await sleep(3000);
-      const { artifacts } = ghJson<{ artifacts: { name: string; size_in_bytes: number }[] }>(`repos/${l.repo}/actions/runs/${run.id}/artifacts`);
+      const { artifacts } = ghJson<{ artifacts: { id: number; name: string; size_in_bytes: number }[] }>(`repos/${l.repo}/actions/runs/${run.id}/artifacts`);
       const artifact = artifacts.find((a) => a.name === "box");
       if (artifact && artifact.size_in_bytes > 65536) throw new Error(`the box artifact is ${artifact.size_in_bytes} bytes`);
-      if (artifact) box = await readBoxArtifact(l.repo, run.id);
+      if (artifact) box = await readBoxArtifact(l.repo, artifact.id);
       else if (ghJson<Run>(`repos/${l.repo}/actions/runs/${run.id}`).status === "completed")
         throw new Error(`run ended before the box came up: ${run.html_url}`);
     }
@@ -658,7 +697,8 @@ async function run(args: string[]) {
   }
   show(decoder.end());
   const exit = ssh(l, `cat ${job}/exit 2>/dev/null`, { timeout: 60_000 });
-  process.exit(/^\d+/.test(exit.stdout ?? "") ? parseInt(exit.stdout, 10) : 255);
+  // Not process.exit: what is still queued for a slow reader would be lost.
+  process.exitCode = /^\d+/.test(exit.stdout ?? "") ? parseInt(exit.stdout, 10) : 255;
 }
 
 // Files go as one tar stream of the paths, which keep their place under ~/src (the current
@@ -673,35 +713,25 @@ async function cp(args: string[]) {
   const [from, to, ...given] = positional(args, ["--via-here"]);
   if (!from || !to || given.length === 0) die("usage: box cp <from> <to> <path>... [--exclude PATTERN]... [--via-here]");
   if (from === to) die("box cp copies between two different boxes");
-  // Plain relative paths: no glob characters or leading @, which bsdtar would read as patterns or
-  // archives, and with this checkout on one side no .git or .claude, which run code here.
+  // Plain relative paths: nothing bsdtar reads as a pattern (glob characters, a trailing $) or
+  // as an operation (a leading -C or @), and with this checkout on one side no .git or .claude
+  // in any case, which run code here, and no link on the way, which could lead into them.
   const local = from === "." || to === ".";
   const paths = given.map((p) => {
     const n = path.posix.isAbsolute(p) ? "" : path.posix.normalize(p).replace(/\/+$/, "");
-    if (!n || n === "." || n === ".." || n.startsWith("../") || /[*?[\\]/.test(n) || n.startsWith("@"))
-      die(`${p} is not a plain path below ~/src`);
-    if (local && n.split("/").some((part) => part === ".git" || part === ".claude")) die(`${p} is git or agent metadata`);
+    if (!n || n === "." || n === ".." || n.startsWith("../") || /[*?[\\]|^[-@^]|\$$/.test(n)) die(`${p} is not a plain path below ~/src`);
+    if (local && n.split("/").some((part) => [".git", ".claude"].includes(part.toLowerCase()))) die(`${p} is git or agent metadata`);
     return n;
   });
-  // Below this checkout in fact, not just in name: no link on the way may lead out of it.
-  if (local) {
-    const root = fs.realpathSync(".");
+  if (local)
     for (const p of paths) {
       const parts = p.split("/");
       for (let i = 1; i <= parts.length; i++) {
         const at = parts.slice(0, i).join("/");
-        const st = fs.lstatSync(at, { throwIfNoEntry: false });
-        if (!st) break;
-        if (!st.isSymbolicLink()) continue;
-        let real = "";
-        try {
-          real = fs.realpathSync(at);
-        } catch {}
-        if (real !== root && !real.startsWith(root + path.sep)) die(`${p} leads out of this checkout through the link ${at}`);
+        if (fs.lstatSync(at, { throwIfNoEntry: false })?.isSymbolicLink()) die(`${p} goes through the link ${at}`);
       }
     }
-  }
-  const excludes = args.flatMap((a, i) => (a === "--exclude" && args[i + 1] ? [`--exclude=${quote(args[i + 1])}`] : []));
+  const excludes = flags(args, "--exclude").map((e) => `--exclude=${quote(e)}`);
   const names = `-- ${paths.map(quote).join(" ")}`;
   const read = (follow: boolean) => `tar -c${follow ? "h" : ""}f - ${excludes.join(" ")} ${names}`;
   const unpack = `tar -xf - ${names}`;
@@ -712,7 +742,7 @@ async function cp(args: string[]) {
     "s=$(mktemp -d) || exit 1",
     `trap 'rm -rf "$s"' EXIT`,
     `gzip -dc | tar -xf - -C "$s" ${names} || exit 1`,
-    `bad=$(find "$s" \\( ! -type f ! -type d -o -name .git -o -name .claude \\) -print -quit) || exit 1`,
+    `bad=$(find "$s" \\( ! -type f ! -type d -o -iname .git -o -iname .claude \\) -print -quit) || exit 1`,
     `if [ -n "$bad" ]; then echo "refused: the box sent links, special files, .git or .claude" >&2; exit 1; fi`,
     `tar -C "$s" -cSf - ${names} | tar -xf -`,
   ].join("\n");
@@ -753,15 +783,14 @@ async function copyDirect(src: Lease, dst: Lease, read: string, unpack: string) 
   // copies take turns with it, and it is never left empty.
   const keys = [
     "if [ -f /etc/agent-box/authorized_keys ]; then f=/etc/agent-box/authorized_keys s=sudo; else f=/c/ProgramData/agent-box/authorized_keys s=; fi",
-    "mkdir -p ~/.box/cp; find ~/.box/cp -maxdepth 1 -name lock -mmin +1 -exec rmdir {} + 2>/dev/null",
-    "got=; for i in $(seq 50); do mkdir ~/.box/cp/lock 2>/dev/null && { got=1; break; }; sleep 0.1; done",
-    '[ -n "$got" ] || { echo "authorized_keys is busy" >&2; exit 1; }',
+    "mkdir -p ~/.box/cp; got=; for i in $(seq 50); do mkdir ~/.box/cp/lock 2>/dev/null && { got=1; break; }; sleep 0.1; done",
+    '[ -n "$got" ] || { echo "~/.box/cp/lock is held; remove it if no box cp is running on this box" >&2; exit 1; }',
   ].join("\n");
   const unlock = "rmdir ~/.box/cp/lock";
   const unauthorize = [
     keys,
     `k=$(mktemp); if grep -q ' ${tag}$' "$f" && grep -v ' ${tag}$' "$f" > $k && [ -s $k ]; then`,
-    `  if [ -n "$s" ]; then sudo sh -c 'cat "$1" > "$2.new" && chmod 644 "$2.new" && mv -f "$2.new" "$2"' - $k "$f"; else cat $k > "$f"; fi`,
+    `  if [ -n "$s" ]; then sudo sh -c 'cat "$1" > "$2.$$" && chmod 644 "$2.$$" && mv -f "$2.$$" "$2"' - $k "$f"; else cat $k > "$f"; fi`,
     `fi; rm -f $k; ${unlock}`,
   ].join("\n");
   const cleanup = () => {
@@ -844,7 +873,13 @@ async function release(l: Lease) {
   if (l.host && ssh(l, "touch ~/.box/stop", { timeout: 20_000 }).status === 0) log(`${l.id}: stopping`);
   // Cancelling the run and deleting the tunnel are tried independently; the lease stays for a
   // retry until both are done. An ended run cannot be cancelled.
+  // A lease whose run was never seen may have one all the same: a dispatch can succeed unseen.
   const failed: string[] = [];
+  try {
+    l.runId ??= findRun(l)?.id;
+  } catch (e) {
+    failed.push(`cannot look for its run: ${String((e as { stderr?: unknown }).stderr || (e as Error).message).trim()}`);
+  }
   if (l.runId) {
     const cancel = spawnSync("gh", ["run", "cancel", String(l.runId), "-R", l.repo], { stdio: "ignore" });
     if (cancel.status !== 0 && !(await runStatus(l)).startsWith("ended")) failed.push(`cannot cancel run ${l.runId}`);
@@ -935,27 +970,30 @@ async function gc() {
   const live = new Set(allLeases().map((l) => l.id));
   const stale = (created: string) => Date.now() - Date.parse(created) > 6 * 3600_000;
   const { zoneId, accountId } = await zoneOf(token, c.zone!);
-  const tunnels = await cf<{ id: string; name: string; created_at: string }[]>(
-    token,
-    `/accounts/${accountId}/cfd_tunnel?is_deleted=false&per_page=1000`,
-  );
-  // A record goes only once its tunnel is gone, so a hostname never outlives a revocation.
-  const left = new Set<string>();
-  for (const t of tunnels) {
+  const pages = async <T>(api: string) => {
+    const all: T[] = [];
+    for (let page = 1; ; page++) {
+      const got = await cf<T[]>(token, `${api}&per_page=100&page=${page}`);
+      all.push(...got);
+      if (got.length < 100) return all;
+    }
+  };
+  // A record goes only once no tunnel of its lease stands, so a hostname never outlives a
+  // revocation.
+  const standing = new Set<string>();
+  for (const t of await pages<{ id: string; name: string; created_at: string }>(`/accounts/${accountId}/cfd_tunnel?is_deleted=false`)) {
     const id = /^agent-box-([0-9a-f]{10})$/.exec(t.name)?.[1];
-    if (!id || live.has(id) || !stale(t.created_at)) continue;
+    if (!id) continue;
+    standing.add(id);
+    if (live.has(id) || !stale(t.created_at)) continue;
     await deleteTunnel(token, accountId, t.id).then(
-      () => log(`deleted tunnel ${t.name}`),
-      (e: Error) => (left.add(id), log(e.message)),
+      () => (standing.delete(id), log(`deleted tunnel ${t.name}`)),
+      (e: Error) => log(e.message),
     );
   }
-  const records = await cf<{ id: string; name: string; comment: string | null; created_on: string }[]>(
-    token,
-    `/zones/${zoneId}/dns_records?type=CNAME&per_page=5000`,
-  );
-  for (const r of records) {
+  for (const r of await pages<{ id: string; name: string; comment: string | null; created_on: string }>(`/zones/${zoneId}/dns_records?type=CNAME`)) {
     const id = /^agent-box ([0-9a-f]{10}) /.exec(r.comment ?? "")?.[1];
-    if (!id || live.has(id) || left.has(id) || r.name !== `box-${id}.${c.zone}` || !stale(r.created_on)) continue;
+    if (!id || live.has(id) || standing.has(id) || r.name !== `box-${id}.${c.zone}` || !stale(r.created_on)) continue;
     await cf(token, `/zones/${zoneId}/dns_records/${r.id}`, "DELETE").then(
       () => log(`deleted dns ${r.name}`),
       (e: Error) => log(e.message),
@@ -1019,13 +1057,17 @@ function install(args: string[]) {
   log(`${repo}:${BRANCH} locked to repo admins`);
 }
 
+// Flags take a value, as `--name value` or `--name=value`, unless they are one of `switches`.
 function flag(args: string[], name: string) {
   const i = args.indexOf(name);
-  return i >= 0 ? args[i + 1] : undefined;
+  return i >= 0 ? args[i + 1] : args.find((a) => a.startsWith(`${name}=`))?.slice(name.length + 1);
 }
-// Flags take a value unless they are one of `switches`.
+function flags(args: string[], name: string) {
+  return args.flatMap((a, i) => (a === name && args[i + 1] !== undefined ? [args[i + 1]] : a.startsWith(`${name}=`) ? [a.slice(name.length + 1)] : []));
+}
 function positional(args: string[], switches: string[] = []) {
-  return args.filter((a, i) => !a.startsWith("--") && !(args[i - 1]?.startsWith("--") && !switches.includes(args[i - 1])));
+  const takesValue = (a: string | undefined) => !!a?.startsWith("--") && !a.includes("=") && !switches.includes(a);
+  return args.filter((a, i) => !a.startsWith("--") && !takesValue(args[i - 1]));
 }
 
 const USAGE = `usage:
